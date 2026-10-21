@@ -22,6 +22,7 @@ from ._common import (
     raster_color_map,
     set_time_xlim,
     split_synapses_by_sign,
+    warn_unused,
 )
 from .colors import (
     EXCITATORY_COLOR,
@@ -246,12 +247,8 @@ def plot_synaptic_currents(
         delta_t (float): Time step in milliseconds.
         n_neurons_plot (int): Number of neurons to plot. Defaults to 10.
         fraction (float): Fraction of duration to plot (0-1). Defaults to 1.0.
-        show_total (bool): Unused; the total current is always drawn in grey. Kept for
-            backward compatibility. Defaults to False.
-        neuron_types (NDArray[np.int32] | None): Unused; kept for backward
-            compatibility. Defaults to None.
-        neuron_params (dict | None): Unused; kept for backward compatibility.
-            Defaults to None.
+        show_total, neuron_types, neuron_params: Deprecated, no effect (the total
+            current is always drawn in grey); passing them warns.
         figsize (tuple[float, float]): Figure size. Defaults to (12, 12).
         ax (plt.Axes | list[plt.Axes] | None): Matplotlib axes to plot on. If None, creates new figure.
             If list, should contain n_neurons_plot axes.
@@ -259,6 +256,18 @@ def plot_synaptic_currents(
     Returns:
         plt.Figure | None: Matplotlib figure object if ax is None, otherwise None.
     """
+    warn_unused(
+        "plot_synaptic_currents",
+        **{
+            name: value
+            for name, value, default in (
+                ("show_total", show_total, False),
+                ("neuron_types", neuron_types, None),
+                ("neuron_params", neuron_params, None),
+            )
+            if value is not default
+        },
+    )
     n_steps = I_exc.shape[1]
     n_steps_plot, start_s, end_s = _plot_window(n_steps, fraction, delta_t)
 
@@ -472,8 +481,8 @@ def plot_spike_trains(
         ylabel = ""
     else:
         ax.set_yticks([] if n_compared is not None else range(n_neurons_plot))
-        default_title = (
-            f"Sample {cell_type.title() if cell_type else ''} Spike Trains".strip()
+        default_title = " ".join(
+            ["Sample", *([cell_type.title()] if cell_type else []), "Spike Trains"]
         )
 
     ax.set_xlabel("Time (s)")

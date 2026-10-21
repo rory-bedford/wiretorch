@@ -9,18 +9,19 @@ the kernels of ``kernels.py``:
 * A recurrent network takes two launches per step: ``compact_spikes`` lists who fired,
   ``recurrent_step`` gathers just those weight rows and integrates.
 * With gradients, the forward pass saves the voltage, conductances and recurrent
-  activations of every step, and ``scan_backward`` is the reverse-time adjoint.
+  activations of every step, and ``scan_backward`` is the reverse-time adjoint. It also
+  gives learnt physiology its gradient, each term compiled in only when that parameter
+  is learnt, from nothing more saved than the conductances entering the chunk.
 
-Set ``CONNECTOME_SNNS_BACKEND=torch`` to force the reference implementation.
+Set ``CONNECTOME_SNNS_BACKEND=torch`` to force the reference implementation. What the
+families share — the dispatch rule, sparse feedforward input — is in
+``network_simulators.engine``.
 """
 
 from __future__ import annotations
 
-import functools
 import itertools
-import os
-import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -30,30 +31,24 @@ from connectome_snns.network_simulators.conductance.dynamics import (
     Physiology,
     Run,
 )
+from connectome_snns.network_simulators.engine import (  # noqa: F401 - re-exported
+    SPARSE_INPUT,
+    _SparseActivations,
+    activations as _activations,
+    pad as _pad,
+    row_start as _row_start,
+    triton,
+    uses_kernels,
+)
 
-warnings.filterwarnings("ignore", "Sparse CSR tensor support is in beta")
-
-try:
-    import triton
-
+if triton is not None:
     from connectome_snns.network_simulators.conductance import kernels
-except ImportError:  # pragma: no cover - CPU-only installs
-    triton = None
 
 BLOCK = 128  # neurons per program (scan kernels)
 STEP_BLOCK = 256  # neurons per program (recurrent step)
 GATHER_ROWS = 16  # weight rows of fired neurons summed per load
 COMPACT_BLOCK = 1024  # neurons per iteration of the spike compaction
 FF_TIME_BLOCK = 256  # steps of feedforward input materialised at once (no gradients)
-
-
-def uses_kernels(x: torch.Tensor, retain) -> bool:
-    return (
-        triton is not None
-        and x.is_cuda
-        and retain is None
-        and os.environ.get("CONNECTOME_SNNS_BACKEND", "triton") != "torch"
-    )
 
 
 def simulate(
@@ -98,16 +93,49 @@ class _Launch:
     track_b: int  # tracked trial, -1 for all, or 0 when not tracking
     tracked: dict[str, torch.Tensor] | None
     dummy: torch.Tensor  # stands in for unused pointer arguments
+    #: Which physiology gradients are wanted, in ``PHYSIOLOGY`` order.
+    wants: tuple[bool, ...] = (False,) * 8
 
     @property
     def K(self) -> int:
         return self.K_rec + self.K_ff
 
+    def flags(self) -> dict[str, bool]:
+        return {f"WANT_{name.upper()}": want for name, want in zip(FLAGS, self.wants)}
 
-def _pad(t: torch.Tensor, SP: int) -> torch.Tensor:
-    out = t.new_zeros((*t.shape[:-1], SP))
-    out[..., : t.shape[-1]] = t
-    return out.contiguous()
+    def backward_block(self) -> int:
+        """Neurons per program of ``scan_backward``: half the usual when the learnt
+        physiology needs six or more per-synapse accumulators (each ``(BLOCK, SP)``),
+        which would otherwise spill registers."""
+        E_syn, decay, jump = self.wants[5:]
+        tiles = E_syn + 4 * decay + 2 * jump  # the decays carry H as well
+        return BLOCK // 2 if tiles >= 6 else BLOCK
+
+    def g_init(self, g: torch.Tensor) -> torch.Tensor:
+        """A float32 copy of the conductances entering the chunk if the decays are
+        learnt, else a dummy."""
+        return g.to(torch.float32, copy=True) if self.wants[6] else self.dummy
+
+
+#: The physiology that can be learnt, as ``Physiology`` names it, and the names of
+#: ``scan_backward``'s flags for each.
+PHYSIOLOGY = ("theta", "U_reset", "E_L", "C_m", "beta", "E_syn", "decay", "jump")
+FLAGS = ("theta", "reset", "E_L", "C_m", "beta", "E_syn", "decay", "jump")
+
+
+def _physiology_grads(L: _Launch, device) -> list[torch.Tensor]:
+    """Zeroed per-(trial, [synapse,] neuron) accumulators of the gradients wanted."""
+    shapes = [(L.B, L.N)] * 5 + [(L.B, L.S, L.N)] + [(L.B, 2, L.S, L.N)] * 2
+    return [
+        torch.empty(shape, device=device) if want else L.dummy
+        for shape, want in zip(shapes, L.wants)
+    ]
+
+
+def _reduce(partials, wants) -> list[torch.Tensor | None]:
+    """Per-neuron (per-synapse; per component and synapse) sums of the accumulators."""
+    dims = [0] * 5 + [(0, 2)] + [(0, 3)] * 2
+    return [g.sum(d) if want else None for g, d, want in zip(partials, dims, wants)]
 
 
 def _prepare(v, x, drive, p, probabilities, track, track_batch_idx) -> _Launch:
@@ -129,12 +157,16 @@ def _prepare(v, x, drive, p, probabilities, track, track_batch_idx) -> _Launch:
         B=B, T=T, N=N, S=S, SP=SP,
         K_rec=len(drive.recurrent), K_ff=len(drive.feedforward),
         made=_pad(drive.made.float(), SP),
-        jump=_pad(p.jump, SP), decay=_pad(p.decay, SP),
-        E_syn=_pad(p.E_syn, SP), g_clip=_pad(p.g_clip, SP),
-        p=p, sample=sample, probabilities=probabilities,
+        jump=_pad(p.jump.detach(), SP), decay=_pad(p.decay.detach(), SP),
+        E_syn=_pad(p.E_syn.detach(), SP), g_clip=_pad(p.g_clip, SP),
+        # The kernels get the physiology detached (the autograd functions take it as
+        # inputs): launching with tensors that require grad costs host time per launch.
+        p=replace(p, **{name: getattr(p, name).detach() for name in PHYSIOLOGY}),
+        sample=sample, probabilities=probabilities,
         noise=torch.rand((B, T, N), device=x.device) if sample else dummy,
         track_b=(-1 if track_batch_idx is None else track_batch_idx) if track else 0,
         tracked=tracked, dummy=dummy,
+        wants=tuple(getattr(p, name).requires_grad for name in PHYSIOLOGY),
     )  # fmt: skip
 
 
@@ -203,34 +235,28 @@ def _recurrent(L, A_ff_blocks, W, rows, sizes, scale, v, g, spikes, saved):
             )  # fmt: skip
 
 
-@functools.lru_cache(maxsize=64)
-def _row_start(sizes: tuple[int, ...], device) -> torch.Tensor:
-    """Where each recurrent pathway's rows begin, plus the end: ``(K + 1,)`` int32.
-
-    Cached, so a forward call copies nothing from the host (a small copy would wait
-    behind the trainer's prefetch of the next batch).
-    """
-    return torch.tensor(
-        [0, *itertools.accumulate(sizes)], device=device, dtype=torch.int32
-    )
-
-
 def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
-    """``scan_backward``: returns ``(grad_A, grad_scale)`` (None where not wanted)."""
-    spikes, v_saved, G_saved = saved
+    """``scan_backward``: returns ``(grad_A, grad_scale, *physiology)`` (None where
+    not wanted). ``saved`` is ``(spikes, v_saved, G_saved, g_init)``."""
     grad_A = torch.empty_like(A) if want_A else L.dummy
     partial = torch.empty((L.K, L.B, L.N), device=A.device) if want_scale else L.dummy
-    kernels.scan_backward[(triton.cdiv(L.B * L.N, BLOCK),)](
+    physiology = _physiology_grads(L, A.device)
+    block = L.backward_block()
+    kernels.scan_backward[(triton.cdiv(L.B * L.N, block),)](
         grad_spikes.contiguous(),
         L.dummy if grad_prob is None else grad_prob.contiguous(),
-        spikes, v_saved, G_saved, A, scale, L.made, L.jump, L.decay,
-        L.E_syn, L.g_clip, L.p.theta, L.p.C_m, L.p.beta, grad_A, partial,
+        *saved, A, scale, L.made, L.jump, L.decay, L.E_syn, L.g_clip,
+        L.p.theta, L.p.E_L, L.p.C_m, L.p.beta, grad_A, partial, *physiology,
         L.p.dt, L.p.surr_scale, L.B, L.T, L.N,
-        K=L.K, KP=triton.next_power_of_2(L.K), S=L.S, SP=L.SP, BLOCK=BLOCK,
-        WANT_A=want_A, WANT_SCALE=want_scale,
+        K=L.K, KP=triton.next_power_of_2(L.K), S=L.S, SP=L.SP, BLOCK=block,
+        WANT_A=want_A, WANT_SCALE=want_scale, **L.flags(),
         PROB=grad_prob is not None, SAMPLE=L.sample,
     )  # fmt: skip
-    return (grad_A if want_A else None), (partial.sum(dim=1) if want_scale else None)
+    return (
+        grad_A if want_A else None,
+        partial.sum(dim=1) if want_scale else None,
+        *_reduce(physiology, L.wants),
+    )
 
 
 # =====================================================================
@@ -239,39 +265,42 @@ def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
 
 
 class _FeedforwardScan(torch.autograd.Function):
-    """Spikes (and probabilities) of a chunk, differentiable in ``A`` and ``scale``."""
+    """Spikes (and probabilities) of a chunk, differentiable in ``A``, ``scale`` and
+    the physiology (``PHYSIOLOGY``, which the kernels read from ``L``)."""
 
     @staticmethod
-    def forward(ctx, A, scale, v, g, L: _Launch):
+    def forward(ctx, A, scale, v, g, L: _Launch, *physiology):
         spikes = torch.empty((L.B, L.T, L.N), device=A.device)
         prob = torch.empty_like(spikes) if L.probabilities else None
         saved = (
             torch.empty_like(spikes),
             torch.empty((L.B, L.T, L.N, L.S), device=A.device, dtype=L.p.storage_dtype),
         )
+        g_init = L.g_init(g)
         _scan(L, A, scale, v, g, spikes, prob, saved)
         ctx.L = L
-        ctx.save_for_backward(A, scale, spikes, *saved)
+        ctx.save_for_backward(A, scale, spikes, *saved, g_init)
         ctx.mark_non_differentiable(v, g)
         return spikes, prob, v, g
 
     @staticmethod
     def backward(ctx, grad_spikes, grad_prob, _v, _g):
-        A, scale, spikes, v_saved, G_saved = ctx.saved_tensors
+        A, scale, *saved = ctx.saved_tensors
         if grad_spikes is None:
-            grad_spikes = torch.zeros_like(spikes)
-        grad_A, grad_scale = _backward(
-            ctx.L, (spikes, v_saved, G_saved), A, scale, grad_spikes, grad_prob,
+            grad_spikes = torch.zeros_like(saved[0])
+        grad_A, grad_scale, *physiology = _backward(
+            ctx.L, saved, A, scale, grad_spikes, grad_prob,
             want_A=ctx.needs_input_grad[0], want_scale=ctx.needs_input_grad[1],
         )  # fmt: skip
-        return grad_A, grad_scale, None, None, None
+        return grad_A, grad_scale, None, None, None, *physiology
 
 
 class _RecurrentRun(torch.autograd.Function):
-    """Spikes of a recurrent chunk, differentiable in ``A_ff``, ``scale`` and ``W``."""
+    """Spikes of a recurrent chunk, differentiable in ``A_ff``, ``scale``, ``W`` and
+    the physiology (``PHYSIOLOGY``, which the kernels read from ``L``)."""
 
     @staticmethod
-    def forward(ctx, A_ff, scale, W, v, g, L: _Launch, rows, sizes):
+    def forward(ctx, A_ff, scale, W, v, g, L: _Launch, rows, sizes, *physiology):
         spikes = torch.empty((L.B, L.T, L.N), device=A_ff.device)
         saved = (
             torch.empty_like(spikes),
@@ -280,20 +309,21 @@ class _RecurrentRun(torch.autograd.Function):
             ),
             torch.empty((L.K_rec, L.B, L.T, L.N), device=A_ff.device),
         )
+        g_init = L.g_init(g)
         _recurrent(L, [(0, A_ff)], W, rows, sizes, scale, v, g, spikes, saved)
         ctx.L, ctx.rows, ctx.sizes = L, rows, sizes
-        ctx.save_for_backward(A_ff, scale, spikes, *saved)
+        ctx.save_for_backward(A_ff, scale, spikes, *saved, g_init)
         ctx.mark_non_differentiable(v, g)
         return spikes, v, g
 
     @staticmethod
     def backward(ctx, grad_spikes, _v, _g):
-        A_ff, scale, spikes, v_saved, G_saved, A_rec = ctx.saved_tensors
+        A_ff, scale, spikes, v_saved, G_saved, A_rec, g_init = ctx.saved_tensors
         L = ctx.L
         want_ff, want_scale, want_W = ctx.needs_input_grad[:3]
         A = torch.cat([A_rec, A_ff]) if L.K_ff else A_rec
-        grad_A, grad_scale = _backward(
-            L, (spikes, v_saved, G_saved), A, scale, grad_spikes, None,
+        grad_A, grad_scale, *physiology = _backward(
+            L, (spikes, v_saved, G_saved, g_init), A, scale, grad_spikes, None,
             want_A=want_ff or want_W, want_scale=want_scale,
         )  # fmt: skip
         grad_W = None
@@ -307,67 +337,7 @@ class _RecurrentRun(torch.autograd.Function):
                 )
             grad_W = torch.cat(pieces)
         grad_ff = grad_A[L.K_rec :] if want_ff else None
-        return grad_ff, grad_scale, grad_W, None, None, None, None, None
-
-
-class _SparseActivations(torch.autograd.Function):
-    """Feedforward activations of sparse input, one cuSPARSE product per pathway.
-
-    Differentiable in the input and the weights; both gradients are dense matmuls
-    (they are needed only for learnt weights, or when the input is another layer's
-    spikes).
-    """
-
-    @staticmethod
-    def forward(ctx, x2d, rows, differentiable, *weights):
-        ctx.rows, ctx.differentiable = rows, differentiable
-        ctx.save_for_backward(x2d, *weights)
-        x2d = x2d.detach()
-        A = x2d.new_empty((len(rows), x2d.shape[0], weights[0].shape[1]))
-        for k, (r, W) in enumerate(zip(rows, weights)):
-            torch.mm(x2d[:, r].to_sparse_csr(), W, out=A[k])
-        return A
-
-    @staticmethod
-    def backward(ctx, grad_A):
-        x2d, *weights = ctx.saved_tensors
-        grad_x = None
-        if ctx.needs_input_grad[0]:
-            grad_x = torch.zeros_like(x2d)
-            span = ctx.differentiable or slice(0, x2d.shape[1])
-            for k, (r, W) in enumerate(zip(ctx.rows, weights)):
-                keep = (r >= span.start) & (r < span.stop)  # only columns that need it
-                grad_x[:, r[keep]] = grad_A[k] @ W[keep].T
-        grad_W = [
-            x2d[:, r].T @ grad_A[k] if ctx.needs_input_grad[3 + k] else None
-            for k, r in enumerate(ctx.rows)
-        ]
-        return grad_x, None, None, *grad_W
-
-
-SPARSE_INPUT = (
-    0.1  # use the sparse path when at most this fraction of inputs is non-zero
-)
-
-
-def _activations(drive: Drive, x: torch.Tensor) -> torch.Tensor:
-    """``(K_ff, B, T, N)`` feedforward activations, by sparse products if input is sparse.
-
-    Density is judged from the first step, which is cheap and, for spike trains, typical.
-    """
-    first = x[:, 0]
-    if (
-        not drive.feedforward
-        or torch.count_nonzero(first) > SPARSE_INPUT * first.numel()
-    ):
-        return drive.feedforward_activations(x)
-    B, T, n_in = x.shape
-    rows = [r for r, _ in drive.feedforward]
-    weights = [W.float() for _, W in drive.feedforward]
-    A = _SparseActivations.apply(
-        x.reshape(B * T, n_in), rows, drive.differentiable_inputs, *weights
-    )
-    return A.view(len(rows), B, T, -1)
+        return grad_ff, grad_scale, grad_W, None, None, None, None, None, *physiology
 
 
 # =====================================================================
@@ -385,14 +355,18 @@ def _simulate_kernels(v, g, x, drive, p, probabilities, track, track_batch_idx) 
     )
     scale = drive.scale.float().contiguous()
     weights = [W for _, W in drive.recurrent] + [W for _, W in drive.feedforward]
+    physiology = [getattr(p, name) for name in PHYSIOLOGY]
     grad = torch.is_grad_enabled() and (
-        scale.requires_grad or x.requires_grad or any(W.requires_grad for W in weights)
+        scale.requires_grad
+        or x.requires_grad
+        or any(W.requires_grad for W in weights)
+        or any(L.wants)
     )
 
     if L.K_rec == 0:
         if grad:
             A = _activations(drive, x).contiguous()
-            spikes, prob, v, g = _FeedforwardScan.apply(A, scale, v, g, L)
+            spikes, prob, v, g = _FeedforwardScan.apply(A, scale, v, g, L, *physiology)
         else:
             spikes = torch.empty((L.B, L.T, L.N), device=x.device)
             prob = torch.empty_like(spikes) if probabilities else None
@@ -408,7 +382,9 @@ def _simulate_kernels(v, g, x, drive, p, probabilities, track, track_batch_idx) 
 
     if grad:
         A_ff = _activations(drive, x).contiguous()
-        spikes, v, g = _RecurrentRun.apply(A_ff, scale, W, v, g, L, rows, sizes)
+        spikes, v, g = _RecurrentRun.apply(
+            A_ff, scale, W, v, g, L, rows, sizes, *physiology
+        )
     else:
         spikes = torch.empty((L.B, L.T, L.N), device=x.device)
 

@@ -127,6 +127,28 @@ def _fingerprint(array: np.ndarray) -> str:
     return hashlib.sha256(data + str(array.dtype).encode()).hexdigest()[:16]
 
 
+def test_between_diagonal_places_the_dropped_edges():
+    """Between-assembly blocks drop edges k -> k unless asked: they join two cells."""
+    from connectome_snns.synthetic_connectome.topology_generators import (
+        assembly_generator,
+    )
+
+    types = np.zeros(8, dtype=int)
+
+    def between_block(probability, flag):
+        adjacency, _ = assembly_generator(
+            types, types, 2, [[0.0]], [[probability]], False, "configuration", flag
+        )
+        assert not np.any(np.diag(adjacency))
+        return adjacency[:4, 4:]
+
+    np.random.seed(0)
+    assert np.all(between_block(1.0, True))
+    with pytest.raises(ValueError, match="at most 12"):
+        between_block(1.0, False)
+    assert np.array_equal(between_block(0.75, False), ~np.eye(4, dtype=bool))
+
+
 @pytest.mark.parametrize("method", ["erdos-renyi", "configuration"])
 def test_feedforward_graphs_keep_edges_from_input_i_to_neuron_i(method):
     """Self-loops are a recurrent notion: input i and neuron i are different cells."""

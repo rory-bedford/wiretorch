@@ -18,6 +18,7 @@ from connectome_snns.visualization._common import (
     raster_color_map,
     split_synapses_by_sign,
     title_above_axes,
+    warn_unused,
 )
 from connectome_snns.visualization.connectivity import (
     plot_weighted_connectivity,
@@ -151,7 +152,6 @@ def create_connectivity_dashboard(
         input_cell_type_indices=input_cell_type_indices,
         plot_fraction=plot_fraction_feedforward,
         ax=ax_ff,
-        show_legend=True,
         section_title="Weighted Connectomes",
         section_title_axes=[ax_ff, ax_rec],
     )
@@ -525,9 +525,6 @@ def _plot_example_neuron(fig, gs_activity, rows, inputs: dict, neuron: int) -> N
         delta_t=dt,
         n_neurons_plot=1,
         fraction=1.0,
-        show_total=False,
-        neuron_types=neuron_types[[neuron]],
-        neuron_params=inputs["neuron_params"],
         ax=[ax_currents],
     )
     ax_currents.set_title("Input Currents", loc="center", pad=10)
@@ -621,8 +618,8 @@ def create_activity_dashboard(
         feedforward_synapse_names (dict[str, list[str]]): Synapse names for each feedforward cell type.
         window_size (float): Window size for PSTH in milliseconds. Defaults to 50.0.
         n_neurons_plot (int): Number of neurons to plot in raster. Defaults to 20.
-        fraction (float): Unused; every panel shows the full duration. Kept for
-            backward compatibility. Defaults to 1.0.
+        fraction (float): Deprecated, no effect (every panel shows the full
+            duration); passing it warns.
         random_seed (int): Random seed for sampling input neurons for the raster
             (seeds NumPy's global RNG). Defaults to 42.
         assembly_ids (NDArray[np.int32] | None): Optional array of assembly IDs for each neuron.
@@ -637,6 +634,8 @@ def create_activity_dashboard(
     Returns:
         plt.Figure: Matplotlib figure object containing the activity dashboard.
     """
+    if fraction != 1.0:
+        warn_unused("create_activity_dashboard", fraction=fraction)
     inputs = dict(
         output_spikes=output_spikes,
         input_spikes=input_spikes,

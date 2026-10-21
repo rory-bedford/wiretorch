@@ -4,12 +4,9 @@ from .checkpointing import save_checkpoint, load_checkpoint
 from .logging import AsyncLogger, AsyncPlotter
 from .losses import (
     VanRossumLoss,
-    BernoulliNLLLoss,
     PoissonKLLoss,
     FiringRateLoss,
     SilentNeuronLoss,
-    ScalingFactorBalanceLoss,
-    MomentMatchLoss,
     CalciumMSELoss,
 )
 from .surrogate_gradients import SurrGradSpike
@@ -24,12 +21,9 @@ __all__ = [
     "AsyncPlotter",
     # Loss functions
     "VanRossumLoss",
-    "BernoulliNLLLoss",
     "PoissonKLLoss",
     "FiringRateLoss",
     "SilentNeuronLoss",
-    "ScalingFactorBalanceLoss",
-    "MomentMatchLoss",
     "CalciumMSELoss",
     # Surrogate gradients
     "SurrGradSpike",

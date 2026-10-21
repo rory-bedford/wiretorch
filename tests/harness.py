@@ -13,25 +13,26 @@ GRAD_STEPS = 100  # length of the single chunk the gradient fixtures backpropaga
 READOUT_SEED = 7
 
 
-def unpack_output(out) -> dict[str, torch.Tensor]:
+def unpack_output(out, output: str = "spikes") -> dict[str, torch.Tensor]:
     """Normalise every simulator's return type to a dict.
 
-    Simulators return spikes, ``(probabilities, spikes)``, or a dict of tracked
-    variables; the result always has ``"spikes"`` and whichever of ``"voltages"``,
-    ``"probabilities"`` and ``"hidden_spikes"`` the model produced.
+    Simulators return their output (spikes, or rates: ``output`` names which),
+    ``(probabilities, spikes)``, or a dict of tracked variables; the result always has
+    the output and whichever of ``"voltages"``, ``"probabilities"`` and
+    ``"hidden_spikes"`` the model produced.
     """
     if isinstance(out, torch.Tensor):
-        return {"spikes": out}
+        return {output: out}
     if isinstance(out, tuple):
         probabilities, spikes = out
         return {"spikes": spikes, "probabilities": probabilities}
-    keep = ("spikes", "voltages", "probabilities", "hidden_spikes")
+    keep = ("spikes", "rates", "voltages", "probabilities", "hidden_spikes")
     return {k: out[k] for k in keep if k in out}
 
 
 def tracks_voltages(scenario: Scenario) -> bool:
     """Whether a free run records voltages (single-layer models with a state)."""
-    return bool(scenario.state_keys) or scenario.name.startswith("current_")
+    return bool(scenario.state_keys)
 
 
 def free_run(scenario: Scenario, built: Built, device="cpu") -> dict[str, np.ndarray]:
@@ -52,13 +53,14 @@ def free_run(scenario: Scenario, built: Built, device="cpu") -> dict[str, np.nda
         for start in range(0, x.shape[1], WINDOW):
             for key, value in model.get_checkpoint_state().items() if states else ():
                 states[key].append(np.array(value))
-            out = unpack_output(model(x[:, start : start + WINDOW]))
+            out = unpack_output(model(x[:, start : start + WINDOW]), built.output)
             chunks.append({k: v.cpu().numpy() for k, v in out.items()})
         for key, value in model.get_checkpoint_state().items() if states else ():
             states[key].append(np.array(value))
 
     record = {k: np.concatenate([c[k] for c in chunks], axis=1) for k in chunks[0]}
-    record["spikes"] = record["spikes"] > 0.5
+    if "spikes" in record:
+        record["spikes"] = record["spikes"] > 0.5
     if "hidden_spikes" in record:
         record["hidden_spikes"] = record["hidden_spikes"] > 0.5
     record.update({f"state.{k}": np.stack(v) for k, v in states.items()})
@@ -66,13 +68,13 @@ def free_run(scenario: Scenario, built: Built, device="cpu") -> dict[str, np.nda
 
 
 def readout_loss(out: dict[str, torch.Tensor]) -> torch.Tensor:
-    """``sum(spikes * R)`` (+ the same for hidden spikes and probabilities).
+    """``sum(output * R)`` (+ the same for hidden spikes and probabilities).
 
     A fixed random linear readout: every spike's surrogate gradient contributes, with
     no loss-function machinery between the simulator and the gradient being tested.
     """
-    loss = out["spikes"].new_zeros(())
-    for i, key in enumerate(("spikes", "hidden_spikes", "probabilities")):
+    loss = next(iter(out.values())).new_zeros(())
+    for i, key in enumerate(("spikes", "hidden_spikes", "probabilities", "rates")):
         if key in out:
             R = loss_readout(READOUT_SEED + i, tuple(out[key].shape))
             loss = loss + (out[key] * R.to(out[key].device)).sum()
@@ -89,6 +91,7 @@ def gradients(
     """Backpropagate ``readout_loss`` through the first ``GRAD_STEPS`` steps.
 
     ``track`` turns on variable tracking (of trial 0), which must not change anything.
+    Gradients are named as the fixtures record them (``Built.recorded_gradient_names``).
     """
     model = built.model.to(device)
     model.track_variables = track
@@ -96,11 +99,13 @@ def gradients(
         for layer in getattr(model, "layer1", model), getattr(model, "layer2", model):
             layer.track_batch_idx = 0
     x = torch.from_numpy(built.input_spikes[:, :GRAD_STEPS]).to(device)
-    loss = readout_loss(unpack_output(model(x)))
+    loss = readout_loss(unpack_output(model(x), built.output))
     loss.backward()
     grads = {
         name: p.grad.detach().cpu().numpy()
         for name, p in model.named_parameters()
         if p.grad is not None
     }
+    if built.recorded_gradient_names is not None:
+        grads = built.recorded_gradient_names(model, grads)
     return float(loss.detach()), grads

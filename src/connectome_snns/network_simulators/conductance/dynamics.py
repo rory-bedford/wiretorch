@@ -18,10 +18,11 @@ spikes only via the surrogate, and never through the reset or through recurrent 
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
+from connectome_snns.network_simulators.network import Drive, Run  # noqa: F401
 from connectome_snns.training_utils.surrogate_gradients import (
     SampleSpike,
     SurrGradSpike,
@@ -55,54 +56,12 @@ class Physiology:
     storage_dtype: torch.dtype = torch.float32
 
 
-@dataclass
-class Drive:
-    """The synaptic drive of one forward call, pathway by pathway.
-
-    A *pathway* is one source cell type on one input side. Recurrent pathways come
-    first; each lists its source neurons (``rows`` of the network's own spikes) and its
-    ``(n_rows, N)`` weights, and likewise feedforward pathways for the input columns.
-
-    ``made`` ``(K, S)`` marks the synapse types each pathway makes; ``scale`` ``(K, N)``
-    multiplies its kernel per target neuron (a scaling factor, or 1).
-    """
-
-    made: torch.Tensor
-    scale: torch.Tensor
-    recurrent: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
-    feedforward: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
-    #: Input columns that can carry a gradient (None: any); the rest are data.
-    differentiable_inputs: slice | None = None
-
-    def kernels(self, jump: torch.Tensor) -> list[torch.Tensor]:
-        """Per pathway, the ``(N, 2, S)`` conductance jump per unit activation."""
-        return [
-            jump[None] * self.scale[k][:, None, None] * self.made[k]
-            for k in range(self.made.shape[0])
-        ]
-
-    def feedforward_activations(self, x: torch.Tensor) -> torch.Tensor:
-        """``(K_ff, B, T, N)``: each feedforward pathway's input times its weights."""
-        B, T = x.shape[:2]
-        if not self.feedforward:
-            return x.new_zeros((0, B, T, 0))
-        return torch.stack([x[:, :, rows] @ W for rows, W in self.feedforward])
-
-
-@dataclass
-class Run:
-    """What a simulation produced.
-
-    ``tracked`` (if tracking) holds, per step: the voltage after the step ``v``, the
-    synaptic and leak currents ``I`` ``(..., S + 1)`` and the conductances after the
-    input ``g``, for the tracked trial(s).
-    """
-
-    spikes: torch.Tensor
-    v: torch.Tensor
-    g: torch.Tensor
-    probabilities: torch.Tensor | None = None
-    tracked: dict[str, torch.Tensor] | None = None
+def jumps(drive: Drive, jump: torch.Tensor) -> list[torch.Tensor]:
+    """Per pathway, the ``(N, 2, S)`` conductance jump per unit activation."""
+    return [
+        jump[None] * drive.scale[k][:, None, None] * drive.made[k]
+        for k in range(drive.made.shape[0])
+    ]
 
 
 def spike(v: torch.Tensor, p: Physiology) -> torch.Tensor:
@@ -134,6 +93,10 @@ def simulate(
 ) -> Run:
     """Simulate ``x.shape[1]`` steps from state ``(v, g)`` with input ``x``.
 
+    Returns a ``Run`` whose ``tracked`` (if tracking) holds, per step: the voltage
+    after the step ``v``, the synaptic and leak currents ``I`` ``(..., S + 1)`` and the
+    conductances after the input ``g``, for the tracked trial(s).
+
     Args:
         v, g: State, ``(B, N)`` and ``(B, N, 2, S)``.
         x: Feedforward input, ``(B, T, n_inputs)``.
@@ -142,7 +105,7 @@ def simulate(
         retain: If a list, append ``(v, g, s)`` of every step with gradients retained.
     """
     A_ff = drive.feedforward_activations(x)
-    kernels = drive.kernels(p.jump)
+    kernels = jumps(drive, p.jump)
     keep = (
         slice(None)
         if track_batch_idx is None
@@ -176,9 +139,9 @@ def simulate(
             tracked["g"].append(g[keep].detach())
 
     return Run(
-        spikes=torch.stack(spikes, dim=1),
+        output=torch.stack(spikes, dim=1),
         v=v,
-        g=g,
+        syn=g,
         probabilities=torch.stack(probs, dim=1) if probabilities else None,
         tracked={k: torch.stack(val, dim=1) for k, val in tracked.items()}
         if track

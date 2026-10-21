@@ -26,6 +26,7 @@ from ._common import (
     figure_and_axes,
     figure_and_axes_grid,
     title_above_axes,
+    warn_unused,
 )
 from .colors import (
     EXCITATORY_COLOR,
@@ -478,14 +479,16 @@ def plot_feedforward_connectivity(
             compatibility.
         plot_fraction (float): Fraction of neurons to display. Defaults to 0.1.
         ax (plt.Axes | None): Matplotlib axes to plot on. If None, creates new figure.
-        show_legend (bool): Unused; the colorbar is always shown. Kept for backward
-            compatibility. Defaults to True.
+        show_legend (bool): Deprecated, no effect (the colorbar is always shown);
+            passing it warns.
         section_title (str | None): Optional section title to add above subplot group in dashboard.
         section_title_axes (list[plt.Axes] | None): List of axes to span title across. Required if section_title provided.
 
     Returns:
         plt.Figure | None: Matplotlib figure object if ax is None, otherwise None.
     """
+    if show_legend is not True:
+        warn_unused("plot_feedforward_connectivity", show_legend=show_legend)
     n_input, n_output = feedforward_weights.shape
     n_input_plot = int(n_input * plot_fraction)
     n_output_plot = int(n_output * plot_fraction)
@@ -1037,10 +1040,8 @@ def plot_synaptic_input_histogram(
         input_cell_type_names (list[str]): Names of input cell types.
         recurrent_g_bar_by_type (dict[str, float]): Total g_bar for each recurrent cell type.
         feedforward_g_bar_by_type (dict[str, float]): Total g_bar for each feedforward cell type.
-        ax (plt.Axes | list[plt.Axes] | None): None to create a new figure, or a list
-            of axes, one per presynaptic type (a figure title is then added above
-            them). A single Axes is ignored and a new figure created, but not
-            returned.
+        ax (plt.Axes | list[plt.Axes] | None): None to create a new figure; a list of
+            axes, one per presynaptic type; or one subplot, split into them.
 
     Returns:
         plt.Figure | None: Matplotlib figure object if ax is None, otherwise None.

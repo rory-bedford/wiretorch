@@ -7,7 +7,7 @@ from matplotlib.figure import Figure
 from numpy.typing import NDArray
 from scipy import stats
 
-from ._common import figure_and_axes, finish_figure
+from ._common import figure_and_axes, figure_and_axes_grid, finish_figure
 from .colors import TAB_BLUE, TAB_ORANGE
 
 
@@ -161,7 +161,7 @@ def _paired_violin_panel(
 def plot_firing_rate_variance_comparison(
     output_firing_rates: NDArray[np.float64],
     output_firing_rates_control: NDArray[np.float64],
-    ax: plt.Axes | None = None,
+    ax: plt.Axes | list[plt.Axes] | None = None,
     n_spaghetti: int = 50,
 ) -> Figure | None:
     """
@@ -176,8 +176,8 @@ def plot_firing_rate_variance_comparison(
             (batch_size, n_patterns, n_neurons). Multiple input patterns.
         output_firing_rates_control (NDArray[np.float64]): Firing rates for control experiment
             with shape (batch_size, 1, n_neurons). Single baseline pattern.
-        ax (plt.Axes | None): Ignored: the plot needs two axes, so a new figure is
-            always created (and returned only when ``ax`` is None).
+        ax (plt.Axes | list[plt.Axes] | None): None for a new figure; two axes (the
+            variability and mean panels); or one subplot, split into the two.
         n_spaghetti (int): Number of randomly sampled neurons to show as spaghetti lines
             (drawn with NumPy's global RNG). Defaults to 50.
 
@@ -204,7 +204,9 @@ def plot_firing_rate_variance_comparison(
     _, p_std = stats.ttest_rel(std_control, std_main, alternative="two-sided")
     _, p_mean = stats.ttest_rel(mean_control, mean_main, alternative="two-sided")
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes, owns_figure = figure_and_axes_grid(
+        ax, 2, vertical=False, figsize=(14, 6), share=False
+    )
 
     # Same sampled neurons in both panels
     if n_spaghetti > 0 and n_neurons > 0:
@@ -240,4 +242,4 @@ def plot_firing_rate_variance_comparison(
         ),
     )
 
-    return finish_figure(fig, ax is None)
+    return finish_figure(fig, owns_figure)

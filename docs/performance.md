@@ -125,8 +125,12 @@ array was one chunk per time block, compressed on one thread. Chunks are now cop
 reused pinned buffers without blocking, filed by a background thread into
 preallocated arrays or zarr (chunked per trial, so compression runs in parallel), while
 the GPU simulates the next chunk: **0.46 s/s** in memory, **3.3 s/s** to zarr. The
-zarr figure is bounded by compressing and writing the float rate arrays to network
-storage.
+zarr figure is bounded by writing the float rate arrays to network storage, not by
+compressing them: OU rates compress 1.2x with any codec (zstd, the default; blosc with
+lz4 or zstd, byte- or bitshuffle) and are written at ~0.12 GB/s to the cluster's network storage
+whichever codec — or none — is used, against ~1 GB/s to a local disk. Only fewer bytes
+would be faster (e.g. rates stored in float16, which would change what is saved).
+Spike arrays compress 44x with the default.
 
 ### Trainer data copies
 
@@ -170,3 +174,146 @@ nudge only once.) Half-observed student gradients: cosine 0.99993 with float32.
 bfloat16 was as fast but rates moved +2% and, without any spike flipped, a small
 network's gradient only kept cosine 0.98 — it is not offered.
 
+### Learnt physiology
+
+`learn=` trains `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L` (per cell type) and
+`tau_rise`, `tau_decay`, `E_syn`, `g_bar` (per synapse type). `scan_backward` gives the
+kernel-level gradients (`theta`, `U_reset`, `E_L`, `C_m`, `beta`, `E_syn`, and each
+component's jump and decay; autograd takes them on to the time constants and
+conductances) from the voltages and conductances it already reads, plus the
+conductances entering the chunk: as in the current-based kernels, the decays' gradient
+is carried back as one more recursion over the injections instead of saving every
+step's components. Each term is compiled in only when its parameter is learnt. Fully
+observed student training (`speed.py training`):
+
+| | s/s |
+|---|---|
+| Fixed physiology | 0.247 (unchanged) |
+| `theta`, `U_reset`, `E_L` | 0.254 |
+| `tau_mem`, `g_L` | 0.259 |
+| `E_syn`, `g_bar` | 0.265 |
+| `tau_rise`, `tau_decay` | 0.263 |
+| All nine | 0.278 (+13%) |
+
+With everything learnt the backward kernel holds seven per-synapse accumulators and
+spilled registers (0.297 s/s); it then runs half-size blocks.
+
+### Saved conductances
+
+The backward pass reads the summed conductances of every step, which the forward pass
+saves (`B x T x N x S`: 800 MB per 160-step chunk of the fully observed student). Their
+traffic is ~4.6 ms of the chunk's 28 ms of GPU time. Recomputing them instead would mean
+checkpointing the state every few steps and re-running each segment inside the
+backward kernel, held in registers or scratch memory, re-reading the activations:
+an estimated ≤7% net, for much harder kernels. Not done; `storage_dtype="float16"`
+already halves that traffic.
+
+### The recurrent step, measured
+
+A teacher step takes 127 µs (`recurrent_step`; `compact_spikes` another 10 µs): 73 µs
+without any spike — the state update, ~24 MB at ~320 GB/s — and ~50 µs to sum the ~37
+weight rows each trial's fired neurons contribute. Those rows are 37 MB per step, more
+than DRAM could deliver in that time: neurons firing in several trials are read from L2.
+A gather from the rows' non-zeros (an occupancy bitmask per 32 targets and a popcount
+into packed values, bit-identical to the dense sum and ~8x fewer bytes) ran at 0.147
+s/s against 0.152 in float32 and was slower in float16 (0.139 against 0.111): the
+gather waits on dependent loads, not on bytes. Larger row tiles spilled registers. The
+host enqueues a step in less time than the GPU runs it, so CUDA graphs would not help
+either; float16 storage (above) remains the lever.
+
+
+## Current-based networks
+
+The current-based networks used to be a Python loop over time steps with a dense
+`spikes @ W` per step, on PyTorch only. They now share the conductance-based networks'
+projection API and engine design (`network_simulators/current/`): a fused feedforward
+scan, a sparse recurrent step (compaction, then a gather of the fired neurons' weight
+rows), and a reverse-time adjoint. From `python benchmarks/speed.py current`: the
+teacher's connectome in natural units (weights rescaled for E 4.6 Hz, I 7.3 Hz), batch
+50, eager, same GPU; old = master before this change on the same inputs.
+
+| | Old | New | New, `storage_dtype="float16"` |
+|---|---|---|---|
+| Recurrent simulation (`inference_mode`, 1000-step chunks) | 0.64 s/s | 0.12 s/s (5.3x) | 0.095 s/s |
+| Recurrent training (forward + backward, 160 steps, scaling factors) | 1.98 s/s | 0.68 s/s (2.9x) | 0.444 s/s |
+| Feedforward simulation | – | 0.115 s/s | 0.115 s/s |
+| Feedforward training | 1.09 s/s | 0.137 s/s (8.0x) | 0.137 s/s |
+
+The feedforward network's input rows are the external inputs plus 5000 rows of spikes
+from another population (as in teacher forcing). Training rows are one forward and
+backward pass of a random spike readout, not a full `SNNTrainer` run; the
+conductance-based figures above (0.246 s/s) include the trainer and the van Rossum
+loss.
+
+Unlike the conductance-based networks, gradients flow through the recurrent spikes, so
+the recurrent backward pass cannot be one per-neuron reverse scan: every step carries
+each pathway's `dL/da` back to the presynaptic spikes through `W^T`. As a dense GEMM that
+was two-thirds of a training chunk; connectomes are sparse (the teacher's 6%), so it is a
+cuSPARSE product per step when the weights are at most 25% dense, which took recurrent
+training from 1.14 to 0.68 s/s. It is gather-bound: a Triton kernel walking each row's
+non-zeros was no faster. With float16 storage it is instead a dense product on the
+tensor cores, `W^T` stored contiguous: 152 µs per step for the teacher against cuSPARSE's
+422 µs (relative error ~4e-4, accumulating in float32), so recurrent training runs at
+0.444 s/s. (A batch of 50 keeps the tensor cores far from their peak; the other
+orientation, `W @ g^T`, took 205 µs.) Correctness: the PyTorch reference reproduces the original
+current-based simulator spike for spike; the kernels are held to it by lockstep,
+gradient and large-network statistics fixtures (`tests/README.md`).
+
+### Learnt physiology
+
+`learn=` trains `tau_mem`, `theta`, `U_reset`, `U_rest`, `R` (per cell type) and
+`tau_syn` (per synapse type). The backward kernels give their gradients from nothing
+saved beyond what the weights' gradients already need, plus the chunk's final voltages
+and initial currents: `beta` and `R` multiply the signed current of a step without a
+spike, which follows from two consecutive voltages, and the decays' gradient
+`sum_t gJ_t I_{t-1}` is rewritten, the currents being linear in their inputs, as one more
+reverse recursion over the injections (`current/kernels.py`). A first version that
+saved the currents of every step cost 40% each for `tau_mem`/`R` and `tau_syn` in
+feedforward training. Each term is compiled in only when its parameter is learnt, so
+fixed physiology costs nothing (the rows above are unchanged).
+
+| Training, s/s | Fixed | One parameter | All six |
+|---|---|---|---|
+| Recurrent | 0.69 | 0.69–0.72 | 0.77 (+12%) |
+| Feedforward | 0.138 | – | 0.155 (+12%) |
+
+Two host-side costs were found on the way, each worth ~10% while any parameter was
+learnt: `TypeParameters` placed the learnt values with `masked_scatter`, whose CUDA
+implementation (and its backward, `masked_select`) synchronises with the host — now
+`index_put`, which does not; and Triton launches with tensors that require grad cost
+more host time, so the kernels get the physiology detached (the autograd functions take
+it as inputs). The rate networks, which also use `TypeParameters`, gained 1–6% in
+training (below).
+
+## Rate networks
+
+`network_simulators/rate/` runs on Triton kernels behind the PyTorch reference:
+a fused scan for feedforward networks, and per recurrent step a rates kernel, one
+product per recurrent pathway and an update kernel, with matching backward kernels
+that also give the learnt physiology its gradient. From `python benchmarks/speed.py
+rate`: the teacher's connectome with ReLU rates (E 1.4, I 0.8), white-noise input,
+batch 50, learnt scaling factors and physiology, same GPU.
+
+| | Reference | Kernels | Kernels, `storage_dtype="float16"` |
+|---|---|---|---|
+| Recurrent simulation (`inference_mode`, 1000-step chunks) | 0.74 s/s | 0.54 s/s | 0.245 s/s |
+| Recurrent training (forward + backward, 160 steps) | 2.50 s/s | 1.14 s/s | 0.69 s/s |
+| Feedforward simulation | 0.64 s/s | 0.37 s/s | 0.128 s/s |
+| Feedforward training | 1.34 s/s | 0.444 s/s | 0.201 s/s |
+
+float32 is the default: float16's ~1e-3 relative error would floor precise fits, and
+small weights lose precision, for 2-3x.
+
+Rates are dense, so unlike spikes there is nothing to skip: every step multiplies all
+rates by the recurrent weights. That product is ~85% of a recurrent step, and the
+input product most of a feedforward chunk, both at about half the GPU's float32 peak
+(dense GEMM 0.42 ms per teacher step; cuSPARSE on the 6%-dense connectome is no
+faster, so it is used only where it wins; one sparse product fusing every pathway,
+measured but not adopted, would save ~10%). float16 runs them on the tensor cores — 2.7x faster products,
+relative error ~1e-3, accumulating in float32 — with the state and elementwise
+arithmetic in float32. Rate networks are not chaotic, so float16 rates agree with
+float32 to ~1e-3 and gradients keep their direction (cosine > 0.999, tested).
+
+The kernels are tested against the reference directly (rates, state, every gradient),
+not through large-network statistics as the spiking networks are: rate networks are not
+chaotic, so the two stay close over whole runs.

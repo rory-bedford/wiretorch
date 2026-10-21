@@ -309,7 +309,7 @@ def test_plot_spike_trains_comparison_mode():
     assert len(ax.get_yticks()) == 0
     assert len(ax.patches) == 2  # groups 0 and 2 shaded
     assert ax.get_ylim() == pytest.approx((-0.5, 3 * 2.3 + 1 + 0.5))
-    assert ax.get_title() == "Sample  Spike Trains"  # (sic) empty cell-type slot
+    assert ax.get_title() == "Sample Spike Trains"
 
 
 def test_plot_input_and_network_wrappers():
@@ -558,6 +558,16 @@ def test_plot_synaptic_input_histogram():
     )
     assert out is None
     assert len(fig2.texts) == 1
+    # One subplot is split in place into the three panels.
+    fig3, ax3 = plt.subplots()
+    out = viz.plot_synaptic_input_histogram(
+        *args,
+        recurrent_g_bar_by_type=SYNAPSE_PARAMS["recurrent_g_bar_by_type"],
+        feedforward_g_bar_by_type=SYNAPSE_PARAMS["feedforward_g_bar_by_type"],
+        ax=ax3,
+    )
+    assert out is None
+    assert [ax.get_title() for ax in fig3.axes] == [ax.get_title() for ax in axes]
 
 
 def test_plot_weight_distribution_by_input_type():
@@ -796,6 +806,31 @@ def test_plot_firing_rate_variance_comparison():
     bodies = [c for c in ax_std.collections if isinstance(c, PolyCollection)]
     assert [_hex(b.get_facecolor()[0]) for b in bodies] == ["#ff7f0e", "#1f77b4"]
     assert "(paired t-test)" in ax_mean.texts[-1].get_text()
+    # On given axes: a list of two, or one subplot split into two.
+    fig2, given = plt.subplots(1, 2)
+    assert (
+        viz.plot_firing_rate_variance_comparison(main, control, ax=list(given)) is None
+    )
+    assert given[1].get_ylabel() == "Mean Firing Rate (Hz)"
+    fig3, single = plt.subplots()
+    assert viz.plot_firing_rate_variance_comparison(main, control, ax=single) is None
+    assert [ax.get_ylabel() for ax in fig3.axes] == [
+        "Standard Deviation in Firing Rate (Hz)",
+        "Mean Firing Rate (Hz)",
+    ]
+
+
+def test_deprecated_plot_arguments_warn():
+    i_exc = _rng(9).random((1, 50, 2))
+    with pytest.warns(DeprecationWarning, match="show_total"):
+        viz.plot_synaptic_currents(
+            i_exc, -i_exc, 0 * i_exc, DT, n_neurons_plot=2, show_total=True
+        )
+    _, ff_weights, _, _ = _weights()
+    with pytest.warns(DeprecationWarning, match="show_legend"):
+        viz.plot_feedforward_connectivity(
+            ff_weights, np.zeros(N_FF, int), 0.5, show_legend=False
+        )
 
 
 # ── scaling_factors ──────────────────────────────────────────────────────────

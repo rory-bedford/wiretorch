@@ -29,7 +29,7 @@ class FeedforwardConductanceLIFNetwork(ConductanceNetwork):
     ``reset_state()`` before an independent simulation.
     """
 
-    conductance_name = "g_FF"
+    state_name = "g_FF"
 
     def __init__(
         self,
@@ -48,6 +48,7 @@ class FeedforwardConductanceLIFNetwork(ConductanceNetwork):
         track_batch_idx: int | None = None,
         storage_dtype: torch.dtype | str = torch.float32,
         return_probabilities: bool = False,
+        learn: dict | None = None,
     ):
         """
         Args:
@@ -63,6 +64,7 @@ class FeedforwardConductanceLIFNetwork(ConductanceNetwork):
             return_probabilities: Also return the per-step escape-noise spike
                 probability ``sigmoid(surrgrad_scale * (v - theta))``, which carries a
                 true gradient (rate losses can filter it instead of sampled spikes).
+            learn: Physiology to train (see ``ConductanceNetwork``).
         """
         self.cell_params_FF = cell_params_FF
         self.synapse_params_FF = synapse_params_FF
@@ -88,6 +90,7 @@ class FeedforwardConductanceLIFNetwork(ConductanceNetwork):
             track_gradients=track_gradients,
             track_batch_idx=track_batch_idx,
             storage_dtype=storage_dtype,
+            learn=learn,
         )  # fmt: skip
         self.register_buffer("cell_type_indices_FF", _long(cell_type_indices_FF))
 

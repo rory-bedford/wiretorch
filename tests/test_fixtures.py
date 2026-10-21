@@ -19,10 +19,11 @@ def test_scenario_fingerprint(name):
     )
 
 
-def test_statistics_fingerprints():
+@pytest.mark.parametrize("fixture", ["statistics", "statistics_current"])
+def test_statistics_fingerprints(fixture):
     from fixtures.generate import STATS_BATCH, STATS_NETWORKS
 
-    _, meta = fixture_io.load("statistics")
+    _, meta = fixture_io.load(fixture)
     for key, recorded in meta["fingerprints"].items():
         name, input_seed = key.split(".")
         builder, kwargs, n_steps = STATS_NETWORKS[name]
@@ -32,7 +33,9 @@ def test_statistics_fingerprints():
         assert fingerprint(built) == recorded, key
 
 
-@pytest.mark.parametrize("name", [*SCENARIOS, "training", "statistics"])
+@pytest.mark.parametrize(
+    "name", [*SCENARIOS, "training", "statistics", "statistics_current"]
+)
 def test_recorded_from_clean_library(name):
     _, meta = fixture_io.load(name)
     assert not meta["library_dirty"], f"{name} was recorded from uncommitted code"

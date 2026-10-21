@@ -12,12 +12,12 @@ the dataset. (For compatibility, the constructor's ``num_epochs``, the checkpoin
 ``epoch`` and the metrics CSV's ``epoch`` column count chunks.)
 
 Checkpoints hold the model (and its simulation state), optimiser, scaler, scheduler,
-random number generators, the losses' carried filter state and the recent loss history.
-``resume`` restores all of it and moves the data to the checkpoint's chunk, so a resumed
-run continues exactly as the uninterrupted one would have, provided no gradients were
-pending at the checkpoint (``checkpoint_interval`` a multiple of ``chunks_per_update``;
-the trainer warns otherwise). The "best" checkpoint is the one with the lowest mean
-loss over the chunks since the previous checkpoint.
+random number generators, the losses' carried filter state, the recent loss history and
+any gradients accumulated since the last update. ``resume`` restores all of it and
+moves the data to the checkpoint's chunk, so a resumed run continues exactly as the
+uninterrupted one would have, from any checkpoint (burn-in chunks included). The
+"best" checkpoint is the one with the lowest mean loss over the chunks trained since
+the previous checkpoint.
 """
 
 from __future__ import annotations
@@ -26,8 +26,6 @@ from collections import deque
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Callable
-
-import warnings
 
 import numpy as np
 import torch
@@ -102,7 +100,8 @@ class SNNTrainer:
         stats_computer: ``fn(snapshot) -> {name: value}`` at each log; ``snapshot``
             holds the kept chunks (spikes, targets, ...) and the scaling factors and
             feedforward weights.
-        connectome_mask, feedforward_mask: Masks for legacy weight-trained models.
+        connectome_mask, feedforward_mask: Where the recurrent and feedforward
+            connections are, for losses and plots that ask for them.
         chunks_per_data_epoch: Chunks in one pass over the dataset.
         burn_in_chunks: Chunks after each data-epoch start that only rebuild state.
         epoch_callbacks: ``fn(data_epoch)`` at each data-epoch start.
@@ -193,15 +192,7 @@ class SNNTrainer:
         self._optimizer_has_stepped = False
         self._batches_to_skip = 0  # set on resuming: data already used
         self._batches: Prefetcher | None = None  # the data on the device, from train()
-
-        if checkpoint_interval % chunks_per_update:
-            warnings.warn(
-                f"checkpoint_interval ({checkpoint_interval}) is not a multiple of "
-                f"chunks_per_update ({chunks_per_update}): checkpoints fall between "
-                "updates, and resuming from one drops the gradients accumulated "
-                "since the last update",
-                stacklevel=2,
-            )
+        self._pending_gradients: dict[str, torch.Tensor] = {}  # set on resuming
 
     # ------------------------------------------------------------------
     # The loop
@@ -213,6 +204,11 @@ class SNNTrainer:
         With ``output_dir``, metrics, checkpoints and plots are written there.
         """
         self.optimizer.zero_grad(set_to_none=True)
+        if self._pending_gradients:
+            for name, p in self._parameters():
+                if name in self._pending_gradients:
+                    p.grad = self._pending_gradients[name].to(p.device)
+            self._pending_gradients = {}
         self._start_logging(output_dir)
         if self.chunk == 0 and output_dir:
             self._save_initial_checkpoint(output_dir)
@@ -231,15 +227,14 @@ class SNNTrainer:
 
             if self._is_burn_in(chunk):
                 self._burn_in()
-                continue
-
-            outputs, losses = self._train_on_chunk()
-            if self._is_due(chunk, self.chunks_per_update):
-                self._update_weights()
-            if self._is_due(chunk, self.log_interval):
-                self._log(chunk)
+            else:
+                self._train_on_chunk()
+                if self._is_due(chunk, self.chunks_per_update):
+                    self._update_weights()
+                if self._is_due(chunk, self.log_interval):
+                    self._log(chunk)
             if output_dir and self._is_due(chunk, self.checkpoint_interval):
-                self._checkpoint(chunk, losses, output_dir)
+                self._checkpoint(chunk, output_dir)
             if self.async_plotter and self._is_due(chunk, self.log_interval * 10):
                 if self.async_plotter.has_pending():  # safety net
                     print(f"  ⚠ Flushing pending plots at chunk {chunk + 1}...")
@@ -274,6 +269,7 @@ class SNNTrainer:
         )
         state = checkpoint.get("training_state", {})
         load_loss_states(self.loss_functions, state.get("loss_states", {}))
+        self._pending_gradients = state.get("gradients", {})
         self.loss_history.extend(
             {name: value.to(self.device) for name, value in losses.items()}
             for losses in state.get("loss_history", [])
@@ -418,27 +414,13 @@ class SNNTrainer:
             self.plot_accumulators[key].append(_to_host(value))
         self.accumulated_chunks = min(self.accumulated_chunks + 1, self.plot_size)
 
-    def _update_weights(self) -> None:
-        """Mask legacy weight gradients, clip, step the optimiser and scheduler state."""
-        self.scaler.unscale_(self.optimizer)
-        with torch.no_grad():
-            if hasattr(self.model, "log_weights"):
-                pairs = (
-                    ("log_weights", self.connectome_mask),
-                    ("log_weights_FF", self.feedforward_mask),
-                )
-            else:
-                pairs = (
-                    ("weights", self.connectome_mask),
-                    ("weights_FF", self.feedforward_mask),
-                )
-            for name, mask in pairs:
-                parameter = (
-                    getattr(self.model, name, None) if mask is not None else None
-                )
-                if isinstance(parameter, torch.Tensor) and parameter.grad is not None:
-                    parameter.grad *= mask
+    def _parameters(self):
+        """The model's named parameters (of the original module if compiled)."""
+        return getattr(self.model, "_orig_mod", self.model).named_parameters()
 
+    def _update_weights(self) -> None:
+        """Clip, step the optimiser and scheduler state."""
+        self.scaler.unscale_(self.optimizer)
         if self.grad_clip_fn is not None:
             self.grad_clip_fn(self.model)
         elif self.grad_norm_clip is not None:
@@ -447,10 +429,9 @@ class SNNTrainer:
             )
 
         # Gradient norms for the next log, kept on the device until then.
-        model = getattr(self.model, "_orig_mod", self.model)
         self._gradient_norms = {
             f"gradients/{name}_norm": p.grad.detach().norm()
-            for name, p in model.named_parameters()
+            for name, p in self._parameters()
             if p.grad is not None
         }
         self.scaler.step(self.optimizer)
@@ -576,20 +557,23 @@ class SNNTrainer:
         self._wandb_log({f"loss/{name}": value for name, value in losses.items()}, 0)
         print(f"Initial checkpoint (epoch 0) saved to {output_dir / 'checkpoints'}")
 
-    def _checkpoint(
-        self, chunk: int, losses: dict[str, torch.Tensor], output_dir: Path
-    ) -> None:
+    def _checkpoint(self, chunk: int, output_dir: Path) -> None:
         """Save a checkpoint (best if its mean loss is the lowest) and plots.
 
         The losses saved and compared are the means over the chunks trained since the
-        previous checkpoint (``losses``, this chunk's, if none are recorded).
+        previous checkpoint; with none (only burn-in since), they are infinite and
+        there are no new plots.
         """
         if self.pbar:
             self.pbar.clear()
         print(
             f"\n{'=' * 60}\nCheckpoint at chunk {chunk + 1}/{self.num_epochs}\n{'=' * 60}"
         )
-        losses = _mean_losses(self._since_checkpoint or [losses])
+        trained = bool(self._since_checkpoint)
+        if trained:
+            losses = _mean_losses(self._since_checkpoint)
+        else:
+            losses = {name: float("inf") for name in [*self.loss_functions, "total"]}
         self._since_checkpoint = []
         if save_checkpoint(
             output_dir=output_dir,
@@ -605,7 +589,7 @@ class SNNTrainer:
             self.best_loss = losses["total"]
         for callback in self.checkpoint_callbacks:
             callback(chunk + 1, output_dir, self.model)
-        if self.plot_generator:
+        if self.plot_generator and trained:
             self._plot(chunk, output_dir)
 
         for name, value in losses.items():
@@ -630,6 +614,11 @@ class SNNTrainer:
                 {name: cpu(value) for name, value in losses.items()}
                 for losses in self.loss_history
             ],
+            "gradients": {
+                name: cpu(p.grad)
+                for name, p in self._parameters()
+                if p.grad is not None
+            },
         }
 
     def _plot(self, chunk: int, output_dir: Path) -> None:

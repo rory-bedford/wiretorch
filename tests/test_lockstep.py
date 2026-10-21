@@ -18,14 +18,14 @@ import torch
 
 import fixture_io
 import harness
-from networks import BATCH_SIZE, SCENARIOS
+from networks import BATCH_SIZE, SCENARIOS, SPIKING
 
 THRESHOLD_MARGIN = 1e-3  # mV
 TOLERANCE = {  # (voltage atol in mV, state rtol, state atol)
     "cpu": (1e-4, 1e-4, 1e-5),
     "cuda": (1e-3, 1e-3, 1e-4),
 }
-LOCKSTEP = [n for n, s in SCENARIOS.items() if s.state_keys]
+LOCKSTEP = [n for n in SPIKING if SCENARIOS[n].state_keys]
 
 
 @pytest.mark.parametrize("name", LOCKSTEP)

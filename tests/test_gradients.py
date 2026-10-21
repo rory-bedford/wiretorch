@@ -10,7 +10,7 @@ import pytest
 
 import fixture_io
 import harness
-from connectome_snns.network_simulators.conductance.network import ConductanceNetwork
+from connectome_snns.network_simulators.network import ProjectionNetwork
 from networks import BATCH_SIZE, SCENARIOS
 
 TRAINABLE = [
@@ -39,19 +39,27 @@ def test_gradients_match(name, device, track):
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    "name", ["recurrent_scaling_factors", "feedforward_scaling_factors"]
+    "name",
+    [
+        "recurrent_scaling_factors",
+        "feedforward_scaling_factors",
+        "current_feedforward",
+    ],
 )
 def test_float16_storage_keeps_the_gradient(name):
-    """Conductances and recurrent weights stored in float16: the same gradient.
+    """Synaptic state and recurrent weights stored in float16: the same gradient.
 
     On these scenarios float16 flips no spike in the gradient window, so the gradient
     differs only by rounding. (In a network this small one flipped spike changes the
-    gradient wholesale, as ``two_layer`` shows; on the teacher the cosine is 0.9999.)
+    gradient wholesale, as ``two_layer`` and ``current_recurrent`` show — natural units
+    leave a float16 current ~1e-3 of threshold, and that network first flips a spike at
+    step 12; on a 5000-neuron conductance-based network the cosine is 0.9999. Recurrent float16
+    runs are checked statistically, in ``test_statistics.py``.)
     """
     recorded, _ = fixture_io.load(name)
     built = SCENARIOS[name].build(BATCH_SIZE)
     for module in built.model.modules():
-        if isinstance(module, ConductanceNetwork):
+        if isinstance(module, ProjectionNetwork):
             module.storage_dtype = "float16"
     _, grads = harness.gradients(built, "cuda")
     flat = np.concatenate([grads[k].ravel() for k in sorted(grads)])

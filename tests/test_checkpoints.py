@@ -4,6 +4,10 @@
 it (``generate.py state_dicts``). The rewritten simulators must accept each one
 strictly — the same keys, shapes and values (floats to a few ulps) — so existing runs
 can be resumed. Buffers since removed (``LEGACY_BUFFERS``) are dropped on load.
+
+The current-based networks have since moved from weight matrices to projections, so
+their former checkpoints have other keys: they are converted on load
+(``current.legacy``) into exactly the network ``from_weights`` builds.
 """
 
 import pytest
@@ -11,12 +15,22 @@ import torch
 
 import fixture_io
 from connectome_snns.network_simulators.checkpoint_compat import LEGACY_BUFFERS
-from networks import BATCH_SIZE, SCENARIOS
+from networks import (
+    BATCH_SIZE,
+    SCENARIOS,
+    SEED,
+    current_recurrent,
+)
 
 RECORDED = torch.load(fixture_io.FIXTURES / "state_dicts.pt", weights_only=False)
 
 
-@pytest.mark.parametrize("name", SCENARIOS)
+FORMER_CURRENT = ["current_recurrent", "current_feedforward"]
+
+
+@pytest.mark.parametrize(
+    "name", [n for n in RECORDED["states"] if n not in FORMER_CURRENT]
+)
 def test_old_state_dict_loads(name):
     recorded = RECORDED["states"][name]
     kept = {k: v for k, v in recorded.items() if k.split(".")[-1] not in LEGACY_BUFFERS}
@@ -35,6 +49,26 @@ def test_old_state_dict_loads(name):
             current[key], value, rtol=0 if exact else 1e-6, atol=0, msg=key
         )
     model.load_state_dict(recorded, strict=True)
+
+
+@pytest.mark.parametrize("name", FORMER_CURRENT)
+def test_former_current_state_dict_converts(name):
+    if name == "current_recurrent":  # the checkpoint predates the current regime
+        model = current_recurrent(BATCH_SIZE, SEED, former=True).model
+    else:
+        model = SCENARIOS[name].build(BATCH_SIZE).model
+    expected = {k: v.clone() for k, v in model.state_dict().items()}
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(1.0)  # so the load has to restore them
+    model.load_state_dict(RECORDED["states"][name], strict=True)
+    loaded = model.state_dict()
+    assert sorted(loaded) == sorted(expected)
+    for key, value in expected.items():
+        exact = not value.is_floating_point()
+        torch.testing.assert_close(
+            loaded[key], value, rtol=0 if exact else 1e-6, atol=0, msg=key
+        )
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ figure, the per-cell-type colour palette, splitting synapse types by sign, and a
 axis-styling idioms.
 """
 
+import warnings
 from collections.abc import Sequence
 
 import matplotlib.pyplot as plt
@@ -50,36 +51,75 @@ def figure_and_axes_grid(
     vertical: bool,
     figsize: tuple[float, float],
     what: str = "",
+    share: bool = True,
 ) -> tuple[plt.Figure, Sequence[plt.Axes], bool]:
     """Return ``(fig, axes, owns_figure)`` for a plot with one panel per item.
 
-    Panels are stacked vertically with a shared x axis (``vertical=True``) or laid out
-    in a row with a shared y axis. ``ax`` may be:
+    Panels are stacked vertically (``vertical=True``) or laid out in a row, sharing
+    the x axis or the y axis respectively unless ``share`` is False. ``ax`` may be:
 
     - None: a new figure is created and returned (``owns_figure`` is True);
-    - a list of exactly ``n_panels`` axes to draw on;
-    - a single Axes: kept for backward compatibility -- a new figure is created but
-      ``owns_figure`` is False, so the caller does not return it.
+    - a sequence of exactly ``n_panels`` axes to draw on;
+    - a single Axes, which is split in place into ``n_panels`` axes (it must be a
+      subplot, so its place in the figure's grid is known).
 
     Args:
         ax: See above.
         n_panels: Number of panels needed.
-        vertical: Stack panels vertically (sharex) instead of in a row (sharey).
+        vertical: Stack panels vertically instead of in a row.
         figsize: Size of a newly created figure.
         what: Optional suffix for the error message, e.g. ``" (E, I, FF)"``.
+        share: Share the axis along which the panels are laid out's other axis.
     """
-    if isinstance(ax, list):
+    if isinstance(ax, (list, tuple)):
         if len(ax) != n_panels:
             raise ValueError(f"Expected {n_panels} axes{what}, got {len(ax)}")
-        return ax[0].get_figure(), ax, False
+        return ax[0].get_figure(), list(ax), False
 
-    if vertical:
-        fig, axes = plt.subplots(n_panels, 1, figsize=figsize, sharex=True)
-    else:
-        fig, axes = plt.subplots(1, n_panels, figsize=figsize, sharey=True)
+    if isinstance(ax, plt.Axes):
+        return ax.get_figure(), split_axes(ax, n_panels, vertical, share), False
+
+    key = ("sharex" if vertical else "sharey") if share else None
+    shape = (n_panels, 1) if vertical else (1, n_panels)
+    fig, axes = plt.subplots(*shape, figsize=figsize, **({key: True} if key else {}))
     if n_panels == 1:
         axes = [axes]
-    return fig, axes, ax is None
+    return fig, list(axes), True
+
+
+def split_axes(
+    ax: plt.Axes, n_panels: int, vertical: bool, share: bool = True
+) -> list[plt.Axes]:
+    """Replace a subplot by ``n_panels`` axes filling its place in the figure."""
+    spec = ax.get_subplotspec()
+    if spec is None:
+        raise ValueError(
+            "a single Axes can be split into panels only if it is a subplot; pass "
+            "a list of axes instead"
+        )
+    fig = ax.get_figure()
+    grid = spec.subgridspec(n_panels, 1) if vertical else spec.subgridspec(1, n_panels)
+    ax.remove()
+    axes = []
+    for i in range(n_panels):
+        shared = {}
+        if share and axes:
+            shared = {"sharex" if vertical else "sharey": axes[0]}
+        axes.append(fig.add_subplot(grid[i], **shared))
+    return axes
+
+
+def warn_unused(function: str, **passed) -> None:
+    """``DeprecationWarning`` for each argument a plot accepts but no longer uses.
+
+    Pass only the arguments the caller set (differing from their defaults).
+    """
+    for name in passed:
+        warnings.warn(
+            f"{function}: {name!r} has no effect and will be removed",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 def finish_figure(fig: plt.Figure, owns_figure: bool) -> plt.Figure | None:

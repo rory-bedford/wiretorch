@@ -153,6 +153,7 @@ def assembly_generator(
     conn_between: List[List[float]],
     allow_self_loops: bool = False,
     method: str = "erdos-renyi",
+    between_diagonal: bool = False,
 ) -> Tuple[BoolArray, IntArray]:
     """
     Generate a graph with assembly structure and cell types.
@@ -170,6 +171,10 @@ def assembly_generator(
         allow_self_loops (bool): Whether to allow connections from neuron i to itself
             (in a recurrent graph only, as for ``sparse_graph_generator``).
         method (str): Method for graph generation. Either "erdos-renyi" or "configuration".
+        between_diagonal (bool): "configuration" only: also place the edges k -> k of
+            each between-assembly block (neuron ``i*size + k`` to ``j*size + k``, two
+            different cells). Off by default, which never places them, so existing
+            graphs regenerate identically.
 
     Returns:
         Tuple[BoolArray, IntArray]:
@@ -188,7 +193,7 @@ def assembly_generator(
         For recurrent connections, pass the same array for both source_cell_types and target_cell_types.
         The "configuration" method places within- and between-assembly edges with
         the configuration model, one block per (source assembly, target assembly);
-        between-assembly blocks never have self-loops.
+        between-assembly blocks drop their diagonal unless ``between_diagonal``.
     """
     _check_method(method)
     allow_self_loops = allow_self_loops or not _is_recurrent(
@@ -236,11 +241,9 @@ def assembly_generator(
             for i in range(num_assemblies)
         ]
         # Within-assembly blocks first, then every between-assembly block
-        # NB: between-assembly blocks drop their edges k -> k (positions within the
-        # block, so different neurons), as they always have.
         blocks = [(i, i, within, allow_self_loops) for i in range(num_assemblies)]
         blocks += [
-            (i, j, between, False)
+            (i, j, between, between_diagonal)
             for i in range(num_assemblies)
             for j in range(num_assemblies)
             if i != j

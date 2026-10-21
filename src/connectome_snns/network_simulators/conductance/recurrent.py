@@ -55,6 +55,7 @@ class ConductanceLIFNetwork(ConductanceNetwork):
         track_gradients: bool = False,
         track_batch_idx: int | None = None,
         storage_dtype: torch.dtype | str = torch.float32,
+        learn: dict | None = None,
     ):
         """
         Args:
@@ -77,6 +78,10 @@ class ConductanceLIFNetwork(ConductanceNetwork):
             storage_dtype: What the CUDA kernels store conductances and recurrent
                 weights in: float32, or float16 for 1.35x faster recurrent steps with
                 the same statistics (see ``ConductanceNetwork.storage_dtype``).
+            learn: Physiology to train, per cell type (``tau_mem``, ``theta``,
+                ``U_reset``, ``E_L``, ``g_L``) or synapse type (``tau_rise``,
+                ``tau_decay``, ``E_syn``, ``g_bar``): True for every type or a list of
+                names (see ``ConductanceNetwork``).
         """
         self.synapse_params = synapse_params
         self.cell_params_FF = cell_params_FF
@@ -107,6 +112,7 @@ class ConductanceLIFNetwork(ConductanceNetwork):
             track_gradients=track_gradients,
             track_batch_idx=track_batch_idx,
             storage_dtype=storage_dtype,
+            learn=learn,
         )  # fmt: skip
         self.register_buffer("cell_type_indices_FF", _long(cell_type_indices_FF))
 

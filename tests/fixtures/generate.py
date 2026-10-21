@@ -1,7 +1,8 @@
 """Record the reference fixtures the test suite compares against.
 
     python tests/fixtures/generate.py              # CPU fixtures (every scenario + training)
-    python tests/fixtures/generate.py statistics   # GPU fixture (large-network statistics)
+    python tests/fixtures/generate.py statistics [fixture ...]  # GPU (large networks)
+    python tests/fixtures/generate.py scenarios [name ...]      # CPU, chosen scenarios
     python tests/fixtures/generate.py state_dicts  # every scenario's state_dict
     python tests/fixtures/generate.py training_log # SNNTrainer's metrics CSV
     python tests/fixtures/generate.py configs      # layer-config method outputs
@@ -12,6 +13,7 @@ therefore a deliberate act — only after a change that is meant to alter the dy
 and never to make a failing test pass. Each file records the commit it came from.
 """
 
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -23,7 +25,16 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import fixture_io  # noqa: E402
 import harness  # noqa: E402
-from networks import BATCH_SIZE, SCENARIOS, SEED, feedforward, fingerprint, recurrent  # noqa: E402
+from networks import (  # noqa: E402
+    BATCH_SIZE,
+    SCENARIOS,
+    SEED,
+    current_feedforward,
+    current_recurrent,
+    feedforward,
+    fingerprint,
+    recurrent,
+)
 
 
 def meta(**extra):
@@ -76,24 +87,26 @@ def training_setup(
     checkpoint_callbacks=None,
     chunks_per_update=2,
 ):
-    """Teacher-forced student, its data and its trainer — shared with the tests.
+    """A feedforward network fitted to a recurrent one's spikes, its data and its
+    trainer — shared with the tests.
 
-    The teacher is ``recurrent_frozen``; the student is ``feedforward_scaling_factors``
-    built on the same seed, so it has the teacher's weights and perturbed scaling
-    factors. Its input rows are the teacher's mitral input and the teacher's spikes.
-    The defaults are the configuration ``training.npz`` was recorded with.
+    The target is ``recurrent_frozen``'s spikes; the model is
+    ``feedforward_scaling_factors`` built on the same seed, so it has that network's
+    weights and perturbed scaling factors. Its input rows are the recurrent network's
+    external input and spikes. The defaults are the configuration ``training.npz`` was
+    recorded with. (The logged stats keep the names ``training_log.npz`` recorded.)
     """
     from connectome_snns.dataloaders.supervised import SpikeData
     from connectome_snns.snn_runners import SNNTrainer
     from connectome_snns.training_utils.losses import VanRossumLoss
     from torch.amp import GradScaler
 
-    teacher = recurrent(BATCH_SIZE, SEED)
-    mitral = torch.from_numpy(teacher.input_spikes).float()
+    source = recurrent(BATCH_SIZE, SEED)
+    external = torch.from_numpy(source.input_spikes).float()
     with torch.no_grad():
-        target = teacher.model(mitral)
-    student = feedforward(BATCH_SIZE, SEED).model
-    inputs = torch.cat([mitral, target], dim=2)
+        target = source.model(external)
+    model = feedforward(BATCH_SIZE, SEED).model
+    inputs = torch.cat([external, target], dim=2)
 
     n_chunks = inputs.shape[1] // TRAIN_CHUNK
     chunks = [
@@ -107,7 +120,7 @@ def training_setup(
         for c in range(n_chunks)
     ]
     trajectory = []
-    optimiser = torch.optim.Adam(student.parameters(), lr=0.05)
+    optimiser = torch.optim.Adam(model.parameters(), lr=0.05)
 
     def spike_rates(snapshot):
         return {
@@ -116,7 +129,7 @@ def training_setup(
         }
 
     trainer = SNNTrainer(
-        model=student,
+        model=model,
         optimizer=optimiser,
         scaler=GradScaler("cuda", enabled=False),
         dataloader=chunks * TRAIN_DATA_EPOCHS,
@@ -141,12 +154,12 @@ def training_setup(
         else None,
         update_callbacks=[
             lambda: trajectory.append(
-                [p.detach().clone().numpy() for p in student.parameters()]
+                [p.detach().clone().numpy() for p in model.parameters()]
             )
         ],
         checkpoint_callbacks=checkpoint_callbacks,
     )
-    names = [name for name, _ in student.named_parameters()]
+    names = [name for name, _ in model.named_parameters()]
     return trainer, trajectory, names
 
 
@@ -194,8 +207,18 @@ STATS_NETWORKS = {
     # name: (builder, kwargs, steps)
     "recurrent": (recurrent, dict(n=2000, n_ff=600), 3000),
     "feedforward": (feedforward, dict(n=1000, n_ff=400), 2000),
+    "current_recurrent": (current_recurrent, dict(n=2000, n_ff=600), 3000),
+    "current_feedforward": (current_feedforward, dict(n=1000, n_ff=400), 2000),
 }
 STATS_INPUT_SEEDS = (0, 1)
+#: The fixture each family's networks are recorded in, and the backend recording them.
+#: The conductance-based ones were recorded from the original simulator; the
+#: current-based ones from the PyTorch reference (``current/dynamics.py``), which
+#: reproduces the original current-based simulator spike for spike.
+STATS_FIXTURES = {
+    "statistics": (("recurrent", "feedforward"), "triton"),
+    "statistics_current": (("current_recurrent", "current_feedforward"), "torch"),
+}
 
 
 def stats_run(name, input_seed, device="cuda", compile=False, storage_dtype="float32"):
@@ -217,16 +240,18 @@ def stats_run(name, input_seed, device="cuda", compile=False, storage_dtype="flo
     return built, (spikes > 0.5).cpu().numpy()
 
 
-def record_statistics():
+def record_statistics(fixture="statistics"):
+    names, backend = STATS_FIXTURES[fixture]
+    os.environ["CONNECTOME_SNNS_BACKEND"] = backend
     arrays, fingerprints = {}, {}
-    for name in STATS_NETWORKS:
+    for name in names:
         for seed in STATS_INPUT_SEEDS:
             built, spikes = stats_run(name, seed)
             arrays[f"{name}.rates.{seed}"] = spikes.mean(axis=(0, 1)) * 1000.0
             arrays[f"{name}.population_rate.{seed}"] = spikes.mean(axis=(0, 2)) * 1000.0
             fingerprints[f"{name}.{seed}"] = fingerprint(built)
-            if name == "feedforward" and seed == 0:
-                arrays["feedforward.spikes"] = spikes
+            if name.endswith("feedforward") and seed == 0:
+                arrays[f"{name}.spikes"] = spikes
             types = built.structure["types"]
             rates = arrays[f"{name}.rates.{seed}"]
             print(
@@ -234,10 +259,11 @@ def record_statistics():
                 f"I {rates[types == 1].mean():.2f} Hz"
             )
     return fixture_io.save(
-        "statistics",
+        fixture,
         arrays,
         meta(
             device=torch.cuda.get_device_name(),
+            backend=backend,
             batch_size=STATS_BATCH,
             burn_in=STATS_BURN_IN,
             fingerprints=fingerprints,
@@ -273,7 +299,8 @@ CONFIG_METHODS = (
 
 
 def config_outputs():
-    """Every layer-config method's output, on the Bernstein teacher's parameters."""
+    """Every layer-config method's output, on a realistic parameter set (the teacher
+    network of the teacher-student experiments)."""
     import json
 
     from connectome_snns.configs.conductance_based import (
@@ -307,8 +334,12 @@ def record_configs():
 if __name__ == "__main__":
     torch.manual_seed(0)
     torch.set_num_threads(1)  # CPU matmul results can depend on the thread count
-    if sys.argv[1:] == ["statistics"]:
-        print(f"Wrote {record_statistics()}")
+    if sys.argv[1:2] == ["statistics"]:
+        for fixture in sys.argv[2:] or STATS_FIXTURES:
+            print(f"Wrote {record_statistics(fixture)}")
+    elif sys.argv[1:2] == ["scenarios"]:
+        for name in sys.argv[2:] or SCENARIOS:
+            print(f"Wrote {record_scenario(SCENARIOS[name])}")
     elif sys.argv[1:] == ["state_dicts"]:
         print(f"Wrote {record_state_dicts()}")
     elif sys.argv[1:] == ["training_log"]:

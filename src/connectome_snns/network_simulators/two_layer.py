@@ -135,6 +135,15 @@ class TwoLayerSNN(nn.Module):
         self.layer2.track_variables = value
 
     @property
+    def track_batch_idx(self):
+        return self.layer2.track_batch_idx
+
+    @track_batch_idx.setter
+    def track_batch_idx(self, value):
+        self.layer1.track_batch_idx = value
+        self.layer2.track_batch_idx = value
+
+    @property
     def device(self):
         return self.layer1.device
 

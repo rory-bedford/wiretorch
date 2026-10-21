@@ -1,8 +1,8 @@
 """A short ``SNNTrainer`` run follows the recorded parameter trajectory.
 
-The teacher-forced student of the Bernstein experiments, in miniature: van Rossum loss
-against teacher spikes, burn-in, gradient accumulation and Adam. Checks the trainer and
-the simulator's backward pass together, update by update.
+A feedforward network fitted to a recurrent network's spikes: van Rossum loss, burn-in,
+gradient accumulation and Adam. Checks the trainer and the simulator's backward pass
+together, update by update.
 """
 
 from pathlib import Path
@@ -81,17 +81,22 @@ def _train_keeping(tmp_path, at, **kwargs):
     return whole
 
 
-@pytest.mark.parametrize("at", [2, 4, 8])
-def test_resume_matches_uninterrupted(tmp_path, at):
+@pytest.mark.parametrize(
+    "at, checkpoint_interval", [(2, 2), (4, 2), (6, 2), (8, 2), (3, 3), (9, 3)]
+)
+def test_resume_matches_uninterrupted(tmp_path, at, checkpoint_interval):
     """Resuming from any checkpoint ends exactly where the uninterrupted run does.
 
-    Five chunks per data epoch, the first of them burn-in (no checkpoint there), an
-    update every two chunks: 2 and 4 are inside the first data epoch, 8 inside the
-    second. The data must be skipped to the checkpoint, and the van Rossum filter state
-    restored.
+    Five chunks per data epoch, the first of them burn-in, an update every two chunks:
+    2 and 4 are inside the first data epoch, 6 after the second's burn-in chunk, 8
+    inside it; 3 and 9 fall between updates, with gradients pending. The data must be
+    skipped to the checkpoint, and the van Rossum filter state and the pending
+    gradients restored.
     """
-    whole = _train_keeping(tmp_path, at, checkpoint_interval=2)
-    resumed, _, _ = training_setup(scheduler=True, checkpoint_interval=2)
+    whole = _train_keeping(tmp_path, at, checkpoint_interval=checkpoint_interval)
+    resumed, _, _ = training_setup(
+        scheduler=True, checkpoint_interval=checkpoint_interval
+    )
     assert resumed.resume(tmp_path / "kept.pt") == at
     resumed.train()
     _assert_same_parameters(whole, resumed)
@@ -146,15 +151,24 @@ def test_interrupted_save_keeps_the_last_checkpoint(tmp_path, monkeypatch):
 
     monkeypatch.setattr(checkpointing.torch, "save", killed)
     with pytest.raises(KeyboardInterrupt):
-        trainer._checkpoint(12, trainer.loss_history[-1], tmp_path)
+        trainer._checkpoint(12, tmp_path)
     monkeypatch.undo()
     assert latest.read_bytes() == before
     assert torch.load(latest, weights_only=False)["epoch"] == 8
 
 
-def test_checkpoints_between_updates_warn():
-    with pytest.warns(UserWarning, match="not a multiple of chunks_per_update"):
-        training_setup(checkpoint_interval=3, chunks_per_update=2)
+def test_burn_in_checkpoints_are_never_best(tmp_path):
+    """A checkpoint with only burn-in since the last has no losses to compare."""
+    import torch
+
+    trainer, _, _ = training_setup(checkpoint_interval=1)
+    trainer.num_epochs = 1  # chunk 0, burn-in
+    trainer.train(output_dir=tmp_path)
+    saved = torch.load(
+        tmp_path / "checkpoints" / "checkpoint_latest.pt", weights_only=False
+    )
+    assert saved["epoch"] == 1 and saved["total"] == float("inf")
+    assert trainer.best_loss == float("inf")
 
 
 def test_plots_get_tracked_variables(tmp_path):

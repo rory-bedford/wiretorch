@@ -1,8 +1,12 @@
 """The spiking-network models.
 
-``conductance`` and ``current`` each hold one model family: its shared machinery and
-its two public networks, ``recurrent`` and ``feedforward``. ``projections`` builds the
-connectivity they take; ``two_layer`` stacks two of them.
+``conductance``, ``current`` and ``rate`` each hold one model family: its physiology,
+its time step (``dynamics``, plain PyTorch; ``kernels``, Triton) and its two public
+networks, ``recurrent`` and ``feedforward``. What the families share is here:
+``network`` (connectivity organised into pathways, and the state), ``engine`` and
+``kernels`` (what their engines and kernels share), ``synapses`` (the synapse
+registry). ``projections`` builds the connectivity they take; ``two_layer`` stacks two
+of them.
 
 The networks used to live one package each (``conductance_based.simulator``,
 ``feedforward_conductance_based.simulator``, ``current_based.simulator``,

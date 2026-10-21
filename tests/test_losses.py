@@ -10,7 +10,13 @@ import numpy as np
 import pytest
 import torch
 
-from connectome_snns.training_utils.losses import PoissonKLLoss, VanRossumLoss
+from connectome_snns.training_utils.losses import (
+    FiringRateLoss,
+    PoissonKLLoss,
+    SilentNeuronLoss,
+    VanRossumLoss,
+    VanRossumRateLoss,
+)
 
 TAU_RISE, TAU_DECAY, DT, CHUNK = 10.0, 100.0, 1.0, 40
 # CPU: the same sums as the definition. CUDA: a recursion, whose rounding differs.
@@ -89,6 +95,60 @@ def test_reset_state_forgets(trains):
     loss_fn(output[:, CHUNK : 2 * CHUNK], target[:, CHUNK : 2 * CHUNK])
     loss_fn.reset_state()
     torch.testing.assert_close(loss_fn(output[:, :CHUNK], target[:, :CHUNK]), first)
+
+
+@pytest.mark.parametrize("use_probability", [False, True])
+def test_rate_loss_filters_the_rate_like_a_train(trains, use_probability):
+    """The target rate goes through the van Rossum filter as a target train would."""
+    output, _ = trains
+    rate = torch.full_like(output, 0.05)
+    loss_fn = VanRossumRateLoss(
+        TAU_RISE, TAU_DECAY, DT, CHUNK, use_probability=use_probability
+    )
+    spike_loss = VanRossumLoss(TAU_RISE, TAU_DECAY, DT, CHUNK)
+    signal = "output_probabilities" if use_probability else "output_spikes"
+    assert loss_fn.required_inputs == [signal, "target_rate"]
+    assert not loss_fn.requires_target
+    for c in range(0, output.shape[1], CHUNK):
+        chunk = slice(c, c + CHUNK)
+        torch.testing.assert_close(
+            loss_fn(target_rate=rate[:, chunk], **{signal: output[:, chunk]}),
+            spike_loss(output[:, chunk], rate[:, chunk]),
+        )
+
+
+def test_firing_rate_loss(trains, tmp_path):
+    """Normalised squared rate error, against a fixed target or the target's spikes."""
+    output, target = trains
+    seconds = output.shape[1] * DT / 1000
+    rate, target_rate = output.sum(1) / seconds, target.sum(1) / seconds
+    expected = ((rate - target_rate) ** 2 / (target_rate + 1.0)).mean()
+
+    per_chunk = FiringRateLoss(DT)
+    assert per_chunk.requires_target
+    torch.testing.assert_close(per_chunk(output, target), expected)
+
+    fixed = FiringRateLoss(DT, target_rate=target_rate)
+    assert not fixed.requires_target
+    torch.testing.assert_close(fixed(output), expected)
+
+    import zarr
+
+    zarr.open_group(str(tmp_path), mode="w").create_array(
+        "output_spikes", data=target.numpy()
+    )
+    loaded = FiringRateLoss.from_spike_data(tmp_path, DT)
+    torch.testing.assert_close(loaded(output), expected)
+
+
+def test_silent_neuron_loss():
+    """``exp(-alpha * rate)``: 1 for a silent neuron, falling as it fires."""
+    spikes = torch.zeros(1, 1000, 3)
+    spikes[0, ::100, 1] = 1  # 10 Hz
+    spikes[0, ::10, 2] = 1  # 100 Hz
+    loss = SilentNeuronLoss(alpha=0.1, dt=DT)(spikes)
+    expected = (1 + np.exp(-1.0) + np.exp(-10.0)) / 3
+    torch.testing.assert_close(loss, torch.tensor(expected, dtype=torch.float32))
 
 
 def test_zero_weight_losses_are_not_computed():

@@ -11,7 +11,7 @@ import pytest
 
 import fixture_io
 import harness
-from networks import BATCH_SIZE, SCENARIOS
+from networks import BATCH_SIZE, SCENARIOS, SPIKING
 
 
 def first_divergence(a, b):
@@ -20,7 +20,7 @@ def first_divergence(a, b):
     return int(np.argmax(differs)) if differs.any() else None
 
 
-@pytest.mark.parametrize("name", SCENARIOS)
+@pytest.mark.parametrize("name", SPIKING)
 def test_spikes_match_exactly(name):
     scenario = SCENARIOS[name]
     recorded, _ = fixture_io.load(name)
@@ -37,7 +37,7 @@ def test_spikes_match_exactly(name):
 
 
 @pytest.mark.parametrize(
-    "name", [n for n, s in SCENARIOS.items() if harness.tracks_voltages(s)]
+    "name", [n for n in SPIKING if harness.tracks_voltages(SCENARIOS[n])]
 )
 def test_voltages_match(name):
     scenario = SCENARIOS[name]

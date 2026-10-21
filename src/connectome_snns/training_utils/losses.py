@@ -6,11 +6,8 @@ for the target spikes); the trainer supplies exactly those
 filters across chunks — implement ``reset_state`` and name the attributes they carry
 in ``CARRIED_STATE`` (saved in checkpoints).
 
-* Spike-train distances: ``VanRossumLoss``, ``VanRossumRateLoss``, ``PoissonKLLoss``,
-  ``BernoulliNLLLoss``.
-* Rate and activity penalties: ``FiringRateLoss``, ``SilentNeuronLoss``,
-  ``AsymmetricSilencePenalty``, ``MomentMatchLoss``.
-* Parameter penalties: ``ScalingFactorBalanceLoss``.
+* Spike-train distances: ``VanRossumLoss``, ``VanRossumRateLoss``, ``PoissonKLLoss``.
+* Rate penalties: ``FiringRateLoss``, ``SilentNeuronLoss``.
 * Observation-space losses: ``CalciumMSELoss``.
 """
 
@@ -24,6 +21,11 @@ from connectome_snns.training_utils.filtering import double_exponential
 def _per_neuron(x: torch.Tensor) -> torch.Tensor:
     """``(batch, time, n)`` -> ``(batch * n, 1, time)``, the layout debug output uses."""
     return x.permute(0, 2, 1).reshape(-1, 1, x.shape[1])
+
+
+def firing_rates(spikes: torch.Tensor, dt: float) -> torch.Tensor:
+    """Firing rates in Hz over the time axis (second to last) of ``spikes``."""
+    return spikes.float().sum(dim=-2) / (spikes.shape[-2] * dt / 1000.0)
 
 
 class VanRossumLoss(nn.Module):
@@ -280,14 +282,8 @@ class FiringRateLoss(nn.Module):
         return cls(dt=dt, target_rate=target_rate, epsilon=epsilon)
 
     def _compute_rates(self, spikes: torch.Tensor) -> torch.Tensor:
-        """Compute firing rates in Hz from spike tensor.
-
-        Returns per-trial rates: (batch, neurons) or (batch, patterns, neurons).
-        """
-        spike_counts = spikes.float().sum(dim=-2)
-        time_steps = spikes.shape[-2]
-        total_time_s = time_steps * self.dt / 1000.0
-        return spike_counts / total_time_s
+        """Per-trial rates in Hz: (batch, neurons) or (batch, patterns, neurons)."""
+        return firing_rates(spikes, self.dt)
 
     def forward(
         self,
@@ -359,119 +355,8 @@ class SilentNeuronLoss(nn.Module):
         Returns:
             torch.Tensor: Mean exponential penalty across all batches and neurons.
         """
-        # Sum over time dimension (always second-to-last)
-        spike_counts = output_spikes.sum(dim=-2)  # (..., n_neurons)
-
-        # Compute time duration in seconds
-        time_steps = output_spikes.shape[-2]
-        total_time_s = time_steps * self.dt / 1000.0
-
-        # Convert to firing rate in Hz
-        firing_rates = spike_counts / total_time_s  # (..., n_neurons)
-
-        # Compute exponential penalty: exp(-alpha * firing_rate)
-        # Silent neurons (firing_rate ~ 0) get penalty ~ 1
-        # Active neurons (firing_rate > 0) get penalty < 1
-        penalty = torch.exp(-self.alpha * firing_rates)
-
-        # Take mean across all dimensions
-        loss = penalty.mean()
-
-        return loss
-
-
-class AsymmetricSilencePenalty(nn.Module):
-    """Penalizes under-firing output neurons relative to the target rate.
-
-    For each (batch, neuron) pair where the target fires at least once,
-    computes penalty = exp(-alpha * output_count / target_count). The ratio
-    is relative to the target, so the penalty adapts to each neuron's
-    expected activity level. Chunks where the target is silent are ignored.
-
-    This creates an asymmetric pressure: under-firing is penalized harshly,
-    while over-firing is handled by other losses (van Rossum, FiringRateLoss).
-    """
-
-    required_inputs = ["output_spikes"]
-    requires_target = True
-
-    def __init__(self, alpha: float = 5.0):
-        """
-        Args:
-            alpha (float): Controls how fast the penalty decays as output
-                approaches the target rate. penalty = exp(-alpha * ratio)
-                where ratio = output_count / target_count.
-                At ratio=0 (silent): penalty=1.
-                At ratio=1 (matching target): penalty=exp(-alpha).
-                With alpha=5: ratio=0.5 -> penalty=0.08, ratio=1.0 -> penalty=0.007.
-                Default: 5.0.
-        """
-        super().__init__()
-        self.alpha = alpha
-
-    def forward(
-        self, output_spikes: torch.Tensor, target_spikes: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            output_spikes: Shape (batch, time, neurons) or (batch, patterns, time, neurons).
-            target_spikes: Same shape as output_spikes.
-
-        Returns:
-            Scalar penalty averaged over (batch, neuron) pairs where target is active.
-        """
-        # Sum over time dimension -> spike counts per (batch, ..., neuron)
-        output_counts = output_spikes.float().sum(dim=-2)
-        target_counts = target_spikes.float().sum(dim=-2)
-
-        # Only penalise where target actually fires in this chunk
-        target_active = target_counts > 0
-
-        if not target_active.any():
-            return torch.tensor(
-                0.0, device=output_spikes.device, dtype=output_spikes.dtype
-            )
-
-        # Ratio of output to target spike counts (0 = silent, 1 = matching)
-        ratio = output_counts[target_active] / target_counts[target_active]
-
-        penalty = torch.exp(-self.alpha * ratio)
-        return penalty.mean()
-
-
-class BernoulliNLLLoss(nn.Module):
-    """Pointwise Bernoulli negative log-likelihood loss.
-
-    Computes binary cross-entropy between the model's per-timestep firing
-    probabilities (from the escape-noise sigmoid) and the target spike train::
-
-        L = -mean(target * log(p) + (1 - target) * log(1 - p))
-
-    This operates on **raw probabilities at each timestep** — no temporal
-    filtering is applied.  Compare with :class:`PoissonKLLoss`, which first
-    smooths spike trains with a double-exponential kernel before computing a
-    KL divergence.
-
-    Requires the model to output ``output_probabilities`` (the sigmoid
-    values *before* Bernoulli sampling).
-    """
-
-    requires_target = True
-    required_inputs = ["output_probabilities", "target_spikes"]
-
-    def __init__(self, eps: float = 1e-7):
-        super().__init__()
-        self.eps = eps
-
-    def forward(
-        self, output_probabilities: torch.Tensor, target_spikes: torch.Tensor
-    ) -> torch.Tensor:
-        prob = torch.clamp(output_probabilities, self.eps, 1.0 - self.eps)
-        target_spikes = target_spikes.float()
-        nll = -(
-            target_spikes * torch.log(prob) + (1 - target_spikes) * torch.log(1 - prob)
-        )
-        return nll.mean()
+        # Silent neurons (rate ~ 0) cost ~1, active ones less.
+        return torch.exp(-self.alpha * firing_rates(output_spikes, self.dt)).mean()
 
 
 class PoissonKLLoss(VanRossumLoss):
@@ -523,87 +408,6 @@ class PoissonKLLoss(VanRossumLoss):
         if self.debug:
             return loss, _per_neuron(output_smooth), _per_neuron(target_smooth)
         return loss
-
-
-class ScalingFactorBalanceLoss(nn.Module):
-    """
-    Loss to encourage recurrent scaling factors to be larger than feedforward scaling factors.
-
-    Computes the ratio of recurrent excitatory scaling factors to feedforward scaling factors
-    and penalizes deviations from a target ratio. This is the scaling factor equivalent of
-    a recurrent/feedforward weight-balance loss.
-
-    Args:
-        target_ratio (float): Target ratio of recurrent/feedforward scaling factors.
-            For example, 2.0 means recurrent scaling factors should be 2x larger on average.
-        excitatory_cell_type (int): Cell type index for excitatory neurons (default: 0).
-    """
-
-    required_inputs = ["scaling_factors", "scaling_factors_FF"]
-    requires_target = False
-
-    def __init__(self, target_ratio: float, excitatory_cell_type: int = 0):
-        """
-        Initialize the scaling factor balance loss.
-
-        Args:
-            target_ratio (float): Target ratio of mean(recurrent_scaling_factors) / mean(feedforward_scaling_factors).
-            excitatory_cell_type (int): Cell type index for excitatory neurons (default: 0).
-        """
-        super().__init__()
-        self.target_ratio = target_ratio
-        self.excitatory_cell_type = excitatory_cell_type
-
-    def forward(
-        self,
-        scaling_factors: torch.Tensor,
-        scaling_factors_FF: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute scaling factor balance loss.
-
-        Args:
-            scaling_factors (torch.Tensor): Recurrent scaling factors (n_source_types, n_target_types).
-            scaling_factors_FF (torch.Tensor): Feedforward scaling factors (n_source_types, n_target_types).
-
-        Returns:
-            torch.Tensor: Scalar loss value.
-        """
-        # Get the recurrent scaling factors for excitatory sources to all targets
-        # scaling_factors shape: (n_source_types, n_target_types)
-        # We want the mean of scaling_factors[excitatory_source, :] (excitatory to all targets)
-        rec_mean = scaling_factors[self.excitatory_cell_type, :].mean()
-
-        # Get the feedforward scaling factors - average across all source types
-        ff_mean = scaling_factors_FF.mean()
-
-        # Compute actual ratio
-        actual_ratio = rec_mean / (ff_mean + 1e-8)
-
-        # Loss is squared difference from target ratio
-        loss = (actual_ratio - self.target_ratio) ** 2
-
-        return loss
-
-
-class MomentMatchLoss(nn.Module):
-    """Penalise differences in mean and variance between two tensors.
-
-    Generic and stateless: takes any two tensors, returns a single scalar
-    ``lambda_mean * (mean(x) - mean(y))**2 + lambda_var * (var(x) - var(y))**2``.
-    Moments are pooled over all elements. Callers handle any slicing
-    (e.g. by cell type) before calling.
-    """
-
-    def __init__(self, lambda_mean: float = 1.0, lambda_var: float = 1.0):
-        super().__init__()
-        self.lambda_mean = lambda_mean
-        self.lambda_var = lambda_var
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        mean_err = (x.mean() - y.mean()).pow(2)
-        var_err = (x.var(unbiased=False) - y.var(unbiased=False)).pow(2)
-        return self.lambda_mean * mean_err + self.lambda_var * var_err
 
 
 class CalciumMSELoss(nn.Module):

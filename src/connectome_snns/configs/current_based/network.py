@@ -1,4 +1,9 @@
-"""Current-based network layer configuration."""
+"""Current-based network layer configuration.
+
+``get_cell_params`` and ``get_synapse_params`` give the arguments of the current-based
+networks (``network_simulators.current``): each cell type's physiology, and one
+synapse type per source cell type (its ``tau_syn``, its sign read from its name).
+"""
 
 from typing import Dict, List, Optional
 
@@ -46,6 +51,10 @@ class RecurrentLayerConfig(Config):
             )
         return cell_params
 
+    def get_synapse_params(self) -> List[Dict[str, float | int | str]]:
+        """One synapse type per cell type, for ``synapse_params`` of the networks."""
+        return _synapse_params(self.cell_types.names, self.physiology)
+
     def get_neuron_params_for_plotting(self) -> Dict[int, Dict[str, float | str]]:
         """Get neuron parameters formatted for visualization functions.
 
@@ -90,3 +99,24 @@ class FeedforwardLayerConfig(Config):
                 }
             )
         return cell_params
+
+    def get_synapse_params(self) -> List[Dict[str, float | int | str]]:
+        """One synapse type per input cell type, for ``synapse_params_FF``."""
+        return _synapse_params(self.cell_types.names, self.physiology)
+
+
+def _synapse_params(names, physiology) -> List[Dict[str, float | int | str]]:
+    """Synapse type ``i`` made by cell type ``i``: its ``tau_syn``, and inhibitory only
+    if its name says so."""
+    return [
+        {
+            "synapse_id": i,
+            "cell_id": i,
+            "name": name,
+            "tau_syn": physiology[name].tau_syn,
+            "type": "inhibitory"
+            if cell_type_sign(name) == "inhibitory"
+            else "excitatory",
+        }
+        for i, name in enumerate(names)
+    ]

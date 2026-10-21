@@ -1,4 +1,4 @@
-"""The teacher-spike datasets serve the recorded spikes, chunk by chunk.
+"""The supervised datasets serve recorded spikes, chunk by chunk.
 
 Uses a small synthetic ``spike_data.zarr``: exact chunks must equal the stored arrays;
 with smoothing, inputs are Bernoulli samples from smoothed rates cached in the archive,
