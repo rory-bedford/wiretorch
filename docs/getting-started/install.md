@@ -1,21 +1,23 @@
 # Installation
 
 wiretorch needs Python 3.13 or later and PyTorch 2.7 or later. Install PyTorch first,
-choosing the build for your machine (see below), then wiretorch:
+choosing the build for your machine ({ref}`see below <pytorch-build>`), then wiretorch:
 
 ```bash
 pip install torch --index-url https://download.pytorch.org/whl/cu129
 pip install wiretorch
 ```
 
-pip keeps the PyTorch you already have. If you skip the first step, it installs PyPI's
-default PyTorch, which on Linux is a CUDA 13 build. That works on CPU and on machines
-with a recent NVIDIA driver, but with an older driver PyTorch won't see the GPU:
-`torch.cuda.is_available()` returns False and everything runs on the CPU.
-
 To log training runs to Weights & Biases, install the extra: `pip install
 "wiretorch[wandb]"`.
 
+Linux with an NVIDIA GPU is recommended. There the networks run on fast GPU kernels
+written in [Triton](https://triton-lang.org), which PyTorch ships only for Linux. On
+macOS and Windows wiretorch runs, but on a plain PyTorch implementation, which is about
+10 times slower to simulate and 40 times slower to train: on Windows on the GPU, on
+macOS on the CPU (Macs have no NVIDIA GPU).
+
+(pytorch-build)=
 ## Choosing a PyTorch build
 
 PyTorch wheels bring their own copy of CUDA, so you don't need to install CUDA
@@ -23,6 +25,11 @@ yourself. What your machine provides is the NVIDIA driver, and the driver limits
 CUDA versions can run. `nvidia-smi` shows that limit in its header, as "CUDA Version".
 This is the newest CUDA the driver supports, not a CUDA installation. Any PyTorch
 build for that version or older will work.
+
+pip keeps the PyTorch you already have. If you don't install one first, pip installs
+PyPI's default, which on Linux is a CUDA 13 build. That needs a recent driver; with an
+older one PyTorch won't see the GPU (`torch.cuda.is_available()` returns False) and
+everything runs on the CPU.
 
 | `nvidia-smi` shows | Install |
 |---|---|
@@ -73,11 +80,9 @@ older PyTorch and are untested. The benchmarks on {doc}`../performance` were run
 Quadro RTX 5000, a Turing card. Newer GPUs should be faster, but the kernels' block
 sizes were chosen on Turing, so they may not reach their peak. AMD GPUs are untested.
 
-Without a GPU, or without Triton (it comes with PyTorch's Linux CUDA builds only), the
-networks run a plain PyTorch implementation. It gives the same results but is about 10
-times slower to simulate and 40 times slower to train. The PyTorch implementation also
-runs on the GPU if you set `WIRETORCH_BACKEND=torch`, or if you request per-step
-gradients.
+Without a GPU or without Triton, the networks run the plain PyTorch implementation,
+which gives the same results more slowly. It is also used on Linux GPUs if you set
+`WIRETORCH_BACKEND=torch`, or if you request per-step gradients.
 
 ## From source
 
