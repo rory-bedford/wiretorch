@@ -5,16 +5,16 @@
 <h1 align="center">wiretorch</h1>
 
 <p align="center">
-  <a href="https://wiretorch.readthedocs.io"><img src="https://img.shields.io/readthedocs/wiretorch" alt="docs"></a>
-  <a href="https://pypi.org/project/wiretorch/"><img src="https://img.shields.io/pypi/v/wiretorch" alt="PyPI"></a>
-  <a href="https://github.com/rory-bedford/wiretorch/actions/workflows/ci.yml"><img src="https://github.com/rory-bedford/wiretorch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://wiretorch.readthedocs.io"><img src="https://img.shields.io/readthedocs/wiretorch?logo=readthedocs&logoColor=white" alt="docs"></a>
+  <a href="https://pypi.org/project/wiretorch/"><img src="https://img.shields.io/pypi/v/wiretorch?logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://github.com/rory-bedford/wiretorch/actions/workflows/ci.yml"><img src="https://github.com/rory-bedford/wiretorch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://codecov.io/gh/rory-bedford/wiretorch"><img src="https://codecov.io/gh/rory-bedford/wiretorch/graph/badge.svg" alt="coverage"></a>
-  <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/inference.json" alt="inference speed"></a>
-  <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/training.json" alt="training speed"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.13+-blue.svg" alt="Python 3.13+"></a>
-  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/pytorch-2.7+-ee4c2c.svg" alt="PyTorch 2.7+"></a>
-  <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/badge/linting-ruff-261230.svg" alt="Ruff"></a>
-  <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/packaging-uv-de5fe9.svg" alt="uv"></a>
+  <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/inference.json&logo=nvidia&logoColor=white" alt="inference speed"></a>
+  <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/training.json&logo=nvidia&logoColor=white" alt="training speed"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.13+-blue?logo=python&logoColor=white" alt="Python 3.13+"></a>
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/pytorch-2.7+-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch 2.7+"></a>
+  <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
+  <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json" alt="uv"></a>
   <a href="https://github.com/rory-bedford/wiretorch/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT license"></a>
 </p>
 
