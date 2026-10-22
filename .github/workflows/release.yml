@@ -1,4 +1,4 @@
-# Pushing a tag vX.Y.Z to the public repo publishes that version: the tests run, then the
+# Pushing a tag vX.Y.Z publishes that version: the tests run, then the
 # package goes to PyPI (trusted publishing, no token) and a GitHub release is made with
 # the version's notes from CHANGELOG.md. Read the Docs builds the tag by itself.
 name: release

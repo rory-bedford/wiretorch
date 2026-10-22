@@ -41,15 +41,15 @@ Read the Docs rebuilds the `latest` docs on every push to `main`.
 
 ## Releasing
 
-A version tag on the public repo publishes that version. For `0.1.0b2`:
+A version tag publishes that version. For `0.1.0b2`:
 
-1. Set the version, `uv version --no-sync 0.1.0b2`, and add a `## [0.1.0b2] - <date>` section
-   to `CHANGELOG.md`. Commit.
-2. Publish it to the public repo, then tag that commit and push the tag:
+1. Set the version, `uv version --no-sync 0.1.0b2`, and add a `## [0.1.0b2] - <date>`
+   section to `CHANGELOG.md`. Commit and push.
+2. Tag the commit and push the tag:
 
    ```bash
    git tag v0.1.0b2
-   git push public v0.1.0b2
+   git push origin v0.1.0b2
    ```
 
 The tag runs the tests, publishes the package to PyPI and makes a GitHub release with
