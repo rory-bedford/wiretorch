@@ -10,7 +10,7 @@ on:
 jobs:
   tests:
     if: github.repository == 'rory-bedford/wiretorch'
-    uses: ./.github/workflows/tests.yml
+    uses: ./.github/workflows/ci.yml
     secrets: inherit
 
   publish:
