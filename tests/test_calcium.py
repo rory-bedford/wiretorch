@@ -10,12 +10,12 @@ import pytest
 import torch
 import zarr
 
-from connectome_snns.dataloaders.supervised import (
+from wiretorch.dataloaders.supervised import (
     ParallelSegmentCalciumDataset,
     RateCalciumFFDataset,
 )
-from connectome_snns.observation_models import CalciumObservationModel
-from connectome_snns.training_utils.losses import CalciumMSELoss
+from wiretorch.observation_models import CalciumObservationModel
+from wiretorch.training_utils.losses import CalciumMSELoss
 
 DT, FRAME_HZ = 1.0, 100.0  # 10 steps per frame
 N_CELLS, CHUNK, FRAMES = 4, 40, 4
@@ -118,7 +118,7 @@ def test_calcium_loss_frame_averages_and_masks_nan():
 def test_calcium_loss_state_survives_a_checkpoint():
     """The latent calcium is saved by ``loss_states`` and restored by
     ``load_loss_states``, so the next chunk renders as if never interrupted."""
-    from connectome_snns.snn_runners.chunks import load_loss_states, loss_states
+    from wiretorch.snn_runners.chunks import load_loss_states, loss_states
 
     def loss():
         return CalciumMSELoss(CalciumObservationModel(gain=0.5, tau=50.0, dt=1.0))

@@ -4,6 +4,7 @@
     python benchmarks/speed.py inference       # teacher simulation only
     python benchmarks/speed.py training        # fully observed student training
     python benchmarks/speed.py partial         # half-observed (two-layer) training
+    python benchmarks/speed.py recurrent       # recurrent (teacher) training
     python benchmarks/speed.py current         # the current-based networks
     python benchmarks/speed.py rate            # the rate networks (kernels and reference)
     python benchmarks/speed.py --badges        # also refresh docs/badges/*.json
@@ -20,6 +21,9 @@ inputs) with the library's connectome generators, so nothing outside this repo i
   chunks, van Rossum loss, an update every 6, logging every 6.
 * **partial** — the same with half the neurons observed (Figure 1's actual setting):
   a ``TwoLayerSNN`` whose hidden layer is recurrent.
+* **recurrent** — the teacher itself trained: one forward and backward pass of
+  160 steps with learnt scaling factors and a random spike readout, as in the
+  current-based and rate benchmarks.
 
 * **current** — current-based networks on the teacher's connectome (natural units,
   weights rescaled for teacher-like rates): simulation and training (one forward +
@@ -45,22 +49,23 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from connectome_snns.configs.conductance_based import (
+from wiretorch.configs.conductance_based import (
     FeedforwardLayerConfig,
     RecurrentLayerConfig,
 )
-from connectome_snns.network_simulators.conductance.recurrent import (
+from wiretorch.network_simulators.conductance.recurrent import (
     ConductanceLIFNetwork,
 )
-from connectome_snns.network_simulators.conductance.feedforward import (
+from wiretorch.network_simulators.conductance.feedforward import (
     FeedforwardConductanceLIFNetwork,
 )
-from connectome_snns.network_simulators.projections import (
+from wiretorch.network_simulators.projections import (
     ScalingFactorProjection,
     make_frozen_projections,
+    make_scaling_factor_projections,
 )
-from connectome_snns.network_simulators.two_layer import TwoLayerSNN
-from connectome_snns.synthetic_connectome import (
+from wiretorch.network_simulators.two_layer import TwoLayerSNN
+from wiretorch.synthetic_connectome import (
     cell_types,
     topology_generators,
     weight_assigners,
@@ -224,6 +229,51 @@ def bench_inference(device, chunk=2500, n_warmup=2, n_timed=6, storage_dtype="fl
     }
 
 
+def bench_recurrent_training(
+    device, chunk=160, n_warmup=2, n_timed=5, storage_dtype="float32"
+):
+    """One forward and backward pass of the teacher with learnt scaling factors (a
+    random spike readout as the loss), as the current-based and rate benchmarks."""
+    s = teacher_structure()
+    rec, ff = RecurrentLayerConfig(**RECURRENT), FeedforwardLayerConfig(**FEEDFORWARD)
+    rec_proj, ff_proj = make_scaling_factor_projections(
+        s["w_rec"], s["w_ff"], s["types"], s["ff_types"],
+        rec.cell_types.names, ff.cell_types.names,
+    )  # fmt: skip
+    model = ConductanceLIFNetwork(
+        dt=DT,
+        rec_projections=rec_proj,
+        ff_projections=ff_proj,
+        cell_type_indices=s["types"],
+        cell_type_indices_FF=s["ff_types"],
+        cell_params=rec.get_cell_params(),
+        cell_params_FF=ff.get_cell_params(),
+        synapse_params=rec.get_synapse_params(),
+        synapse_params_FF=ff.get_synapse_params(),
+        surrgrad_scale=1.0,
+        batch_size=BATCH,
+        storage_dtype=storage_dtype,
+    ).to(device)
+    generator = torch.Generator(device).manual_seed(SEED)
+    x = poisson(chunk, [RATE_MITRAL] * s["ff_types"].size, device, generator)
+    readout = torch.randn(
+        BATCH, chunk, s["types"].size, device=device, generator=generator
+    )
+    durations = []
+    for _ in range(n_warmup + n_timed):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        model.reset_state()
+        model.zero_grad()
+        (model(x) * readout).sum().backward()
+        torch.cuda.synchronize()
+        durations.append(time.perf_counter() - start)
+    return {
+        "wall_s_per_network_s": per_second(durations[n_warmup:], chunk),
+        "chunk_steps": chunk,
+    }
+
+
 # =====================================================================
 # Training
 # =====================================================================
@@ -360,9 +410,9 @@ def bench_training(
     device, observed=1.0, chunk=160, chunks_per_epoch=30, burn_in=5, n_epochs=2,
     storage_dtype="float32",
 ):  # fmt: skip
-    from connectome_snns.dataloaders.supervised import SpikeData
-    from connectome_snns.snn_runners import SNNTrainer
-    from connectome_snns.training_utils.losses import VanRossumLoss
+    from wiretorch.dataloaders.supervised import SpikeData
+    from wiretorch.snn_runners import SNNTrainer
+    from wiretorch.training_utils.losses import VanRossumLoss
     from torch.amp import GradScaler
 
     s = teacher_structure()
@@ -449,7 +499,7 @@ CURRENT_SCALE = dict(recurrent=2.0, inhibitory=10.0, feedforward=4.0)
 
 
 def bench_current(device, n_warmup=2, n_timed=5, storage_dtype="float32"):
-    from connectome_snns.network_simulators.current import (
+    from wiretorch.network_simulators.current import (
         CurrentLIFNetwork,
         FeedforwardCurrentLIFNetwork,
     )
@@ -563,7 +613,7 @@ RATE_LEARN = {"tau_mem": True, "theta": True, "gain": True, "tau_syn": True}
 def bench_rate(device, n_warmup=2, n_timed=5):
     import os
 
-    from connectome_snns.network_simulators.rate import (
+    from wiretorch.network_simulators.rate import (
         FeedforwardRateNetwork,
         RecurrentRateNetwork,
     )
@@ -636,7 +686,7 @@ def bench_rate(device, n_warmup=2, n_timed=5):
         ("triton-float16", "triton", "float16"),
         ("torch", "torch", "float32"),
     ):
-        os.environ["CONNECTOME_SNNS_BACKEND"] = backend
+        os.environ["WIRETORCH_BACKEND"] = backend
         out = result[label] = {}
         model = recurrent()
         model.storage_dtype = dtype
@@ -673,7 +723,7 @@ def bench_rate(device, n_warmup=2, n_timed=5):
         out["feedforward_training"], _ = timed(
             lambda: train_step(model, x, readout), chunk
         )
-    os.environ.pop("CONNECTOME_SNNS_BACKEND")
+    os.environ.pop("WIRETORCH_BACKEND")
     return result
 
 
@@ -698,7 +748,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "which",
         nargs="?",
-        choices=["inference", "training", "partial", "current", "rate", "all"],
+        choices=[
+            "inference",
+            "training",
+            "partial",
+            "recurrent",
+            "current",
+            "rate",
+            "all",
+        ],
         default="all",
     )
     parser.add_argument(
@@ -733,6 +791,12 @@ if __name__ == "__main__":
             device, observed=0.5, storage_dtype=args.storage_dtype
         )
         print("partial:", json.dumps(result["partial"]["wall_s_per_network_s"]))
+
+    if args.which in ("recurrent", "all"):
+        result["recurrent"] = bench_recurrent_training(
+            device, storage_dtype=args.storage_dtype
+        )
+        print("recurrent:", json.dumps(result["recurrent"]["wall_s_per_network_s"]))
 
     if args.which in ("current", "all"):
         result["current"] = bench_current(device, storage_dtype=args.storage_dtype)

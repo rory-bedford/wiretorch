@@ -29,30 +29,30 @@ import numpy as np
 import torch
 from torch import nn
 
-from connectome_snns.network_simulators.conductance.recurrent import (
+from wiretorch.network_simulators.conductance.recurrent import (
     ConductanceLIFNetwork,
 )
-from connectome_snns.network_simulators.current.recurrent import (
+from wiretorch.network_simulators.current.recurrent import (
     CurrentLIFNetwork,
 )
-from connectome_snns.network_simulators.conductance.feedforward import (
+from wiretorch.network_simulators.conductance.feedforward import (
     FeedforwardConductanceLIFNetwork,
 )
-from connectome_snns.network_simulators.current.legacy import former_factors
-from connectome_snns.network_simulators.current.feedforward import (
+from wiretorch.network_simulators.current.legacy import former_factors
+from wiretorch.network_simulators.current.feedforward import (
     FeedforwardCurrentLIFNetwork,
 )
-from connectome_snns.network_simulators.projections import (
+from wiretorch.network_simulators.projections import (
     FullRankProjection,
     LowRankProjection,
     ScalingFactorProjection,
     make_frozen_projections,
 )
-from connectome_snns.network_simulators.rate import (
+from wiretorch.network_simulators.rate import (
     FeedforwardRateNetwork,
     RecurrentRateNetwork,
 )
-from connectome_snns.network_simulators.two_layer import TwoLayerSNN
+from wiretorch.network_simulators.two_layer import TwoLayerSNN
 
 DT = 1.0  # ms
 
@@ -317,7 +317,8 @@ def feedforward(
             V = np.stack(
                 [np.full(n_tgt, np.log(W_MEAN[src])), rng.normal(0, 0.3, n_tgt)]
             )
-            drawn[f"{src}->{tgt}"] = U @ V
+            # The factors, not U @ V, whose last bits depend on the BLAS build.
+            drawn[f"{src}->{tgt}.U"], drawn[f"{src}->{tgt}.V"] = U, V
             projections[(src, tgt)] = LowRankProjection(
                 n_src, n_tgt, rank=2, U_init=U, V_init=V, mask=block != 0
             )

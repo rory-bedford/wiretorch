@@ -8,15 +8,15 @@ import numpy as np
 import pytest
 import torch
 
-from connectome_snns.configs.input_patterns import (
+from wiretorch.configs.input_patterns import (
     InputPatternConfig,
     load_input_patterns,
 )
-from connectome_snns.dataloaders.input_patterns import (
+from wiretorch.dataloaders.input_patterns import (
     generate_assembly_firing_rates,
     generate_baseline_firing_rates,
 )
-from connectome_snns.dataloaders.unsupervised import (
+from wiretorch.dataloaders.unsupervised import (
     HomogeneousPoissonSpikeDataLoader,
 )
 
@@ -82,8 +82,8 @@ def test_load_input_patterns(table):
 
 
 def test_legacy_names_still_import_and_agree():
-    from connectome_snns.configs.odours import OdourInputConfig
-    from connectome_snns.dataloaders.odourants import (
+    from wiretorch.configs.odours import OdourInputConfig
+    from wiretorch.dataloaders.odourants import (
         generate_baseline_firing_rates as legacy_baseline,
         generate_odour_firing_rates,
     )

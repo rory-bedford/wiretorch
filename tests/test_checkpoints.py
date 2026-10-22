@@ -14,7 +14,7 @@ import pytest
 import torch
 
 import fixture_io
-from connectome_snns.network_simulators.checkpoint_compat import LEGACY_BUFFERS
+from wiretorch.network_simulators.checkpoint_compat import LEGACY_BUFFERS
 from networks import (
     BATCH_SIZE,
     SCENARIOS,
@@ -95,7 +95,7 @@ def test_former_network_import_paths(former, name, now):
     """Experiments (and pickles) naming the networks' former modules still find them."""
     import importlib
 
-    package = "connectome_snns.network_simulators"
+    package = "wiretorch.network_simulators"
     old = importlib.import_module(f"{package}.{former}")
     assert getattr(old, name) is getattr(
         importlib.import_module(f"{package}.{now}"), name
@@ -103,7 +103,7 @@ def test_former_network_import_paths(former, name, now):
 
 
 def test_former_current_base_class_name():
-    from connectome_snns.network_simulators.current.network import CurrentNetwork
-    from connectome_snns.network_simulators.current_based import CurrentLIFNetwork_IO
+    from wiretorch.network_simulators.current.network import CurrentNetwork
+    from wiretorch.network_simulators.current_based import CurrentLIFNetwork_IO
 
     assert CurrentLIFNetwork_IO is CurrentNetwork

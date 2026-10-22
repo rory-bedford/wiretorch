@@ -109,7 +109,7 @@ def test_threshold_is_read_at_run_time(name, device):
 
 def test_scaling_factor_is_applied_once(device):
     """A scaling factor set at construction scales the weights once, not twice."""
-    from connectome_snns.network_simulators.projections import ScalingFactorProjection
+    from wiretorch.network_simulators.projections import ScalingFactorProjection
 
     def spikes(factor):
         model, x = build("feedforward_scaling_factors", device)

@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from connectome_snns.network_simulators.conductance import engine
-from connectome_snns.network_simulators.conductance.dynamics import Drive
+from wiretorch.network_simulators.conductance import engine
+from wiretorch.network_simulators.conductance.dynamics import Drive
 
 pytestmark = pytest.mark.gpu
 
@@ -45,7 +45,7 @@ def test_current_kernels_with_rest_and_resistance(monkeypatch):
 
     results = []
     for backend in ("triton", "torch"):
-        monkeypatch.setenv("CONNECTOME_SNNS_BACKEND", backend)
+        monkeypatch.setenv("WIRETORCH_BACKEND", backend)
         model, x = _current_network("cuda", spikes_per_step=0.3, weight=0.1)
         model.track_variables = False
         x.requires_grad_()
@@ -67,7 +67,7 @@ def test_current_kernels_with_rest_and_resistance(monkeypatch):
 def test_current_presynaptic_product_in_float16():
     """With float16 storage, ``dL/da`` reaches the presynaptic spikes through a dense
     tensor-core product: the cuSPARSE one's result, up to float16 rounding."""
-    from connectome_snns.network_simulators.current.engine import _presynaptic
+    from wiretorch.network_simulators.current.engine import _presynaptic
 
     torch.manual_seed(0)
     W = (torch.rand(300, 700, device="cuda") < 0.06) * torch.rand(
@@ -104,3 +104,17 @@ def test_current_recurrent_float16_keeps_the_gradient():
     assert s32.sum() > 0
     torch.testing.assert_close(s16, s32, rtol=0, atol=0)
     assert torch.nn.functional.cosine_similarity(g16, g32, dim=0) > 0.999
+
+
+def test_tracked_steps_stack_contiguously():
+    """The reference stacks tracked steps with ``stack_steps``: PyTorch 2.8's CUDA
+    ``torch.stack`` of more than 128 non-contiguous tensors — as the synaptic state is,
+    a permuted view — writes out of bounds (an illegal memory access at this shape)."""
+    from wiretorch.network_simulators.network import stack_steps
+
+    state = torch.randn(4, 2, 3, 500, device="cuda").permute(0, 3, 1, 2)
+    steps = [state * (i + 1) for i in range(300)]
+    stacked = stack_steps(steps)
+    torch.cuda.synchronize()
+    assert stacked.shape == (4, 300, 500, 2, 3)
+    torch.testing.assert_close(stacked[:, 299], steps[299], rtol=0, atol=0)

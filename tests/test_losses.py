@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from connectome_snns.training_utils.losses import (
+from wiretorch.training_utils.losses import (
     FiringRateLoss,
     PoissonKLLoss,
     SilentNeuronLoss,
@@ -152,7 +152,7 @@ def test_silent_neuron_loss():
 
 
 def test_zero_weight_losses_are_not_computed():
-    from connectome_snns.snn_runners.chunks import weighted_losses
+    from wiretorch.snn_runners.chunks import weighted_losses
 
     calls = []
 

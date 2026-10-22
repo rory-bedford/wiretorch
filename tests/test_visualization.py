@@ -1,4 +1,4 @@
-"""Smoke and characterisation tests for :mod:`connectome_snns.visualization`.
+"""Smoke and characterisation tests for :mod:`wiretorch.visualization`.
 
 Every public plotting function is called on small, seeded synthetic inputs. Each test
 checks that the call succeeds and pins down a few cheap properties of what is drawn
@@ -17,9 +17,9 @@ import pytest  # noqa: E402
 from matplotlib.collections import PolyCollection  # noqa: E402
 from matplotlib.colors import to_hex  # noqa: E402
 
-import connectome_snns.visualization as viz  # noqa: E402
-from connectome_snns.visualization import colors as vcolors  # noqa: E402
-from connectome_snns.visualization import (  # noqa: E402
+import wiretorch.visualization as viz  # noqa: E402
+from wiretorch.visualization import colors as vcolors  # noqa: E402
+from wiretorch.visualization import (  # noqa: E402
     connectivity,
     dashboards,
     firing_statistics,
@@ -142,7 +142,7 @@ def test_public_names_importable():
 
 
 def test_legacy_names_still_import():
-    from connectome_snns.visualization import inputs, odours
+    from wiretorch.visualization import inputs, odours
 
     assert viz.plot_mitral_cell_spikes is viz.plot_input_spikes
     assert viz.plot_dp_network_spikes is viz.plot_network_spikes
@@ -462,9 +462,14 @@ def test_plot_input_count_pie_chart():
         _hex(viz.INHIBITORY_COLOR),
     ]
     assert wedges[0].get_facecolor()[3] == pytest.approx(0x99 / 255)
+    # Matplotlib orders the labels and percentages differently between versions.
     texts = [t.get_text() for t in ax.texts]
-    assert texts[0::2] == ["input", "excitatory", "inhibitory"]
-    assert all(t.isdigit() for t in texts[1::2])
+    assert [t for t in texts if not t.isdigit()] == [
+        "input",
+        "excitatory",
+        "inhibitory",
+    ]
+    assert sum(t.isdigit() for t in texts) == 3
 
 
 def test_plot_input_count_distribution():
@@ -505,8 +510,8 @@ def test_plot_synaptic_drive_pie_chart():
     )
     assert ax.get_title() == "Mean Synaptic Drive (Charge)"
     assert len(ax.patches) == 3
-    autotexts = [t.get_text() for t in ax.texts][1::2]
-    assert all("." in t for t in autotexts)
+    texts = [t.get_text() for t in ax.texts]
+    assert sum("." in t for t in texts) == 3  # the percentages, in any order
     with pytest.raises(ValueError, match="g_bar"):
         bad = dict(SYNAPSE_PARAMS, feedforward_g_bar_by_type={})
         viz.plot_synaptic_drive_pie_chart(
@@ -876,7 +881,7 @@ def test_plot_sf_vs_parameter_and_bar_chart():
 
 
 def test_resolve_sf_column_short_alias():
-    from connectome_snns.visualization.scaling_factors import _resolve_sf_column
+    from wiretorch.visualization.scaling_factors import _resolve_sf_column
 
     df = pd.DataFrame({"exc_to_exc": [1.0]})
     assert _resolve_sf_column(df, "excitatory_to_excitatory") == "exc_to_exc"
@@ -885,7 +890,7 @@ def test_resolve_sf_column_short_alias():
 def test_feedforward_pathways_match_any_input_type():
     """``feedforward_to_*`` finds the input population whatever it is called (and
     never a recurrent pathway), in logs and in value dicts."""
-    from connectome_snns.visualization.scaling_factors import _resolve_sf_column
+    from wiretorch.visualization.scaling_factors import _resolve_sf_column
 
     df = pd.DataFrame(
         columns=[
@@ -1049,7 +1054,7 @@ def test_example_neuron_rate_closest_to_the_excitatory_mean():
     ],
 )
 def test_cell_type_sign_reads_whole_words(name, sign):
-    from connectome_snns.configs.network import cell_type_sign
+    from wiretorch.configs.network import cell_type_sign
 
     assert cell_type_sign(name) == sign
     assert _hex(connectivity._source_color(name)) == _hex(
@@ -1122,3 +1127,40 @@ def test_create_assembly_activity_dashboard():
     assert len(ax_ou.lines) == 3
     assert len(ax_pop.lines) == 3
     assert _hex(ax_ou.lines[1].get_color()) == _hex(ax_pop.lines[1].get_color())
+
+
+# ── Theme ─────────────────────────────────────────────────────────────────────
+
+
+def test_theme_figure_html_shows_both_themes_and_leaves_the_figure_unchanged():
+    from wiretorch.visualization import theme
+
+    with matplotlib.rc_context():
+        theme.use_theme(notebook=False)
+        fig, ax = plt.subplots()
+        (line,) = ax.plot([0, 1], color=theme.MUTED)
+        ax.scatter([0, 1], [1, 0], color=theme.EXCITATORY)
+        title = ax.set_title("t")
+        html = theme.figure_html(fig)
+        assert html.count('class="wt-light"') == html.count('class="wt-dark"') == 1
+        # After drawing the dark version the figure is back in the light theme.
+        assert to_hex(line.get_color()) == theme.MUTED
+        assert to_hex(title.get_color()) == theme.INK
+        assert to_hex(fig.get_facecolor()) == theme.LIGHT["background"]
+        assert to_hex(ax.collections[0].get_facecolors()[0]) == theme.EXCITATORY
+        plt.close(fig)
+
+
+def test_theme_dark_recolouring_swaps_furniture_but_not_data():
+    from wiretorch.visualization import theme
+
+    with matplotlib.rc_context():
+        theme.use_theme(notebook=False)
+        fig, ax = plt.subplots()
+        (ref,) = ax.plot([0, 1], color="k")
+        (data,) = ax.plot([0, 1], color=theme.BLUE)
+        theme._recolour(fig, theme._swaps(theme.LIGHT, theme.DARK))
+        assert to_hex(ref.get_color()) == theme.DARK["ink"]
+        assert to_hex(data.get_color()) == theme.BLUE
+        assert to_hex(fig.get_facecolor()) == theme.DARK["background"]
+        plt.close(fig)

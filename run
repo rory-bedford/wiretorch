@@ -12,7 +12,7 @@
 # Grid search:
 #   If only one path is given after --grid, it's the experiment config.
 #   If two paths are given, first is the grid script, second is the config.
-#   Auto-detection looks for run_grid_search.py in the experiment directory, else uses src/connectome_snns/run_grid_search.py
+#   Auto-detection looks for run_grid_search.py in the experiment directory, else uses src/wiretorch/run_grid_search.py
 
 set -e
 
@@ -67,7 +67,7 @@ if [ -n "$GRID" ]; then
         if [ -f "$EXPERIMENT_DIR/run_grid_search.py" ]; then
             GRID_SCRIPT="$EXPERIMENT_DIR/run_grid_search.py"
         else
-            GRID_SCRIPT="src/connectome_snns/run_grid_search.py"
+            GRID_SCRIPT="src/wiretorch/run_grid_search.py"
         fi
     else
         # Two args: first is grid script, second is config
@@ -87,7 +87,7 @@ else
     fi
 
     # Build command
-    CMD=(uv run python src/connectome_snns/run_experiment.py "$CONFIG_FILE")
+    CMD=(uv run python src/wiretorch/run_experiment.py "$CONFIG_FILE")
     if [ -n "$RESUME_DIR" ]; then
         CMD+=(--resume "$RESUME_DIR")
     fi

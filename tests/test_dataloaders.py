@@ -10,8 +10,8 @@ import pytest
 import torch
 import zarr
 
-from connectome_snns.dataloaders.supervised import ExactFFDataset
-from connectome_snns.dataloaders.supervised._smoothing import smooth_spike_trains
+from wiretorch.dataloaders.supervised import ExactFFDataset
+from wiretorch.dataloaders.supervised._smoothing import smooth_spike_trains
 
 B, T, N_FF, N_REC, CHUNK = 2, 120, 6, 5, 30
 
@@ -87,7 +87,7 @@ def test_cache_is_reused_and_incomplete_cache_rebuilt(archive, capsys):
 @pytest.mark.parametrize("alpha", [1 - 1 / 700000, 0.9, 0.5])
 def test_ar1_trajectory_matches_the_recurrence(alpha):
     """Including short time constants, where 1 / alpha^T would overflow float32."""
-    from connectome_snns.utils.recurrences import ar1_trajectory
+    from wiretorch.utils.recurrences import ar1_trajectory
 
     torch.manual_seed(0)
     s0, noise = torch.randn(3, 4), 0.1 * torch.randn(3, 2500, 4)
@@ -105,8 +105,8 @@ def test_ar1_trajectory_matches_the_recurrence(alpha):
 
 
 def test_collates():
-    from connectome_snns.dataloaders.supervised import SpikeData
-    from connectome_snns.dataloaders.supervised.collate import (
+    from wiretorch.dataloaders.supervised import SpikeData
+    from wiretorch.dataloaders.supervised.collate import (
         FeedforwardCollate,
         VisibleSubsetCollate,
         single_neuron_collate_fn,

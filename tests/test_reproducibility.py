@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 import toml
 
-from connectome_snns.utils.experiment_runners import run_experiment
-from connectome_snns.utils.reproducibility import (
+from wiretorch.utils.experiment_runners import run_experiment
+from wiretorch.utils.reproducibility import (
     absolute_config,
     get_repo_root,
     load_experiment_config,
@@ -67,7 +67,7 @@ def test_repo_root():
 def test_uncommitted_files_parses_renames(tmp_path):
     import subprocess
 
-    from connectome_snns.utils.reproducibility import uncommitted_files
+    from wiretorch.utils.reproducibility import uncommitted_files
 
     def git(*args):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
@@ -102,11 +102,11 @@ import json
 from pathlib import Path
 from pathlib import Path
 
-import connectome_snns
+import wiretorch
 
 def main(input_dir, output_dir, params_file):
     (Path(output_dir) / "where.json").write_text(json.dumps({
-        "script": __file__, "library": connectome_snns.__file__,
+        "script": __file__, "library": wiretorch.__file__,
     }))
 """
 
@@ -117,13 +117,13 @@ def test_grid_search_jobs_run_the_snapshot(tmp_path, monkeypatch):
     config says; the snapshot is gone afterwards."""
     import shutil
 
-    from connectome_snns.utils import grid_search
-    from connectome_snns.utils.experiment_config import get_repo_root
+    from wiretorch.utils import grid_search
+    from wiretorch.utils.experiment_config import get_repo_root
 
     library = tmp_path / "library"
     shutil.copytree(
-        get_repo_root() / "src" / "connectome_snns",
-        library / "src" / "connectome_snns",
+        get_repo_root() / "src" / "wiretorch",
+        library / "src" / "wiretorch",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     _commit_all(library)
@@ -144,7 +144,7 @@ def test_grid_search_jobs_run_the_snapshot(tmp_path, monkeypatch):
     def edit_checkouts_then_yield(base):
         # The jobs start after these edits; they must not see them.
         (project / "exp" / "train.py").write_text("raise RuntimeError('live')\n")
-        (library / "src" / "connectome_snns" / "run_experiment.py").write_text(
+        (library / "src" / "wiretorch" / "run_experiment.py").write_text(
             "raise RuntimeError('live library')\n"
         )
         yield {**base, "x": 2}, "two"
@@ -171,7 +171,7 @@ def test_grid_search_jobs_run_the_snapshot(tmp_path, monkeypatch):
     root = snapshots / snapshot
     assert Path(where["script"]) == root / "project" / "exp" / "train.py"
     assert Path(where["library"]) == (
-        root / "connectome-snns-library" / "src" / "connectome_snns" / "__init__.py"
+        root / "wiretorch-library" / "src" / "wiretorch" / "__init__.py"
     )
     parameters = tmp_path / "results" / "two" / "parameters.toml"
     assert toml.loads(parameters.read_text()) == {"x": 2}
@@ -188,7 +188,7 @@ def test_resume_is_tracked(tmp_path, monkeypatch):
     )
     run_experiment(path, skip_git_check=True)
 
-    from connectome_snns.utils.experiment_runners import resume_experiment
+    from wiretorch.utils.experiment_runners import resume_experiment
 
     run_dir = tmp_path / "project" / "results" / "run"
     resume_experiment(path, run_dir, skip_git_check=True)
@@ -203,8 +203,8 @@ def test_resume_is_tracked(tmp_path, monkeypatch):
 def test_resume_checks_git_status(tmp_path, monkeypatch):
     path = experiment(tmp_path)
     run_experiment(path, skip_git_check=True)
-    from connectome_snns.utils import reproducibility
-    from connectome_snns.utils.experiment_runners import resume_experiment
+    from wiretorch.utils import reproducibility
+    from wiretorch.utils.experiment_runners import resume_experiment
 
     monkeypatch.setattr(reproducibility, "uncommitted_files", lambda: ["model.py"])
     with pytest.raises(SystemExit):
@@ -212,7 +212,7 @@ def test_resume_checks_git_status(tmp_path, monkeypatch):
 
 
 def test_run_experiment_cli(tmp_path, monkeypatch):
-    from connectome_snns import run_experiment as cli
+    from wiretorch import run_experiment as cli
 
     calls = []
     monkeypatch.setattr(

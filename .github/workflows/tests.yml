@@ -2,9 +2,19 @@ name: tests
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  workflow_call:  # by release.yml, before publishing
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uvx ruff@0.14.0 check .  # keep in step with .pre-commit-config.yaml
+      - run: uvx ruff@0.14.0 format --check .
+
   cpu:
     # GitHub's runners have no GPU: the tests marked `gpu` skip here.
     runs-on: ubuntu-latest
@@ -20,7 +30,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          uv run --extra cpu pytest -m "not gpu" 2>&1 | tee pytest.log
+          uv run --extra cpu pytest -m "not gpu" --cov --cov-report=xml 2>&1 | tee pytest.log
       # The tail of the output as an annotation, readable without opening the log.
       - name: report failure
         if: failure()
@@ -28,3 +38,21 @@ jobs:
         run: |
           tail -n 60 pytest.log | sed -e 's/%/%25/g' | awk 'BEGIN{ORS="%0A"} {print}' > tail.txt
           echo "::error title=pytest::$(cat tail.txt)"
+      - name: upload coverage
+        if: github.repository == 'rory-bedford/wiretorch'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+
+  docs:
+    # The documentation builds without warnings, from the docs group alone (as on
+    # Read the Docs): no torch, no package install.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - run: uv sync --frozen --only-group docs
+      - run: uv run --no-sync sphinx-build -W docs docs/_build/html

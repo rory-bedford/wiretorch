@@ -1,0 +1,58 @@
+# Pushing a tag vX.Y.Z to the public repo publishes that version: the tests run, then the
+# package goes to PyPI (trusted publishing, no token) and a GitHub release is made with
+# the version's notes from CHANGELOG.md. Read the Docs builds the tag by itself.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  tests:
+    if: github.repository == 'rory-bedford/wiretorch'
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+
+  publish:
+    needs: tests
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write  # the GitHub release
+      id-token: write  # trusted publishing to PyPI
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+      - name: check the tag matches the version
+        shell: bash
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but pyproject.toml has version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: release notes from CHANGELOG.md
+        shell: bash
+        run: |
+          awk -v v="$VERSION" '
+            /^## \[/ { found = index($0, "## [" v "]") == 1; next }
+            found
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+      - run: uv build
+      - run: uv publish --trusted-publishing always
+      - name: GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          [[ "$VERSION" =~ [a-z] ]] && flags+=(--prerelease)  # 0.1.0b1, 0.2.0rc1
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md "${flags[@]}"

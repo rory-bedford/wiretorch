@@ -10,7 +10,7 @@ import pytest
 
 import fixture_io
 import harness
-from connectome_snns.network_simulators.network import ProjectionNetwork
+from wiretorch.network_simulators.network import ProjectionNetwork
 from networks import BATCH_SIZE, SCENARIOS
 
 TRAINABLE = [

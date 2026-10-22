@@ -28,9 +28,9 @@ def unpack_spikes(bits: np.ndarray, shape: np.ndarray) -> np.ndarray:
 
 def library_commit() -> dict[str, str | bool]:
     """The commit of the imported library, and whether its source differs from it."""
-    import connectome_snns
+    import wiretorch
 
-    repo = Path(connectome_snns.__file__).parents[2]  # <repo>/src/connectome_snns
+    repo = Path(wiretorch.__file__).parents[2]  # <repo>/src/wiretorch
 
     def git(*args):
         return subprocess.run(

@@ -7,7 +7,7 @@ import pytest
 import torch
 import zarr
 
-from connectome_snns.snn_runners import SNNInference
+from wiretorch.snn_runners import SNNInference
 from networks import SCENARIOS
 
 Batch = namedtuple("Batch", ["input_spikes", "rates"])

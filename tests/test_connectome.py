@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from connectome_snns.synthetic_connectome.topology_generators import (
+from wiretorch.synthetic_connectome.topology_generators import (
     dense_graph_generator,
     sparse_graph_generator,
 )
@@ -40,7 +40,7 @@ def test_dense_graph():
 
 @pytest.mark.parametrize("assigner", ["lognormal", "gamma", "uniform"])
 def test_weight_assigners_sign_and_mask(assigner):
-    from connectome_snns.synthetic_connectome import weight_assigners as wa
+    from wiretorch.synthetic_connectome import weight_assigners as wa
 
     rng = np.random.default_rng(0)
     graph = rng.random((50, 50)) < 0.3
@@ -129,7 +129,7 @@ def _fingerprint(array: np.ndarray) -> str:
 
 def test_between_diagonal_places_the_dropped_edges():
     """Between-assembly blocks drop edges k -> k unless asked: they join two cells."""
-    from connectome_snns.synthetic_connectome.topology_generators import (
+    from wiretorch.synthetic_connectome.topology_generators import (
         assembly_generator,
     )
 
@@ -152,7 +152,7 @@ def test_between_diagonal_places_the_dropped_edges():
 @pytest.mark.parametrize("method", ["erdos-renyi", "configuration"])
 def test_feedforward_graphs_keep_edges_from_input_i_to_neuron_i(method):
     """Self-loops are a recurrent notion: input i and neuron i are different cells."""
-    from connectome_snns.synthetic_connectome import topology_generators
+    from wiretorch.synthetic_connectome import topology_generators
 
     graphs = []
     for allow in (False, True):
@@ -168,7 +168,7 @@ def test_feedforward_graphs_keep_edges_from_input_i_to_neuron_i(method):
 
 @pytest.mark.parametrize("case", GENERATED)
 def test_generated_connectomes_unchanged(case):
-    from connectome_snns.synthetic_connectome import topology_generators
+    from wiretorch.synthetic_connectome import topology_generators
 
     make, expected = GENERATED[case]
     np.random.seed(7)
@@ -190,7 +190,7 @@ def test_sparse_graph_rejects_bad_arguments(kwargs):
 
 
 def test_assembly_generator_rejects_bad_arguments():
-    from connectome_snns.synthetic_connectome.topology_generators import (
+    from wiretorch.synthetic_connectome.topology_generators import (
         assembly_generator,
     )
 
@@ -211,7 +211,7 @@ def test_impossible_configuration_graph_raises_instead_of_hanging():
 
 def test_configuration_model_large_block_path_matches(monkeypatch):
     """Blocks too big to track incrementally re-sort every round: same graph."""
-    from connectome_snns.synthetic_connectome import topology_generators
+    from wiretorch.synthetic_connectome import topology_generators
 
     args = (_E_I, _E_I, [[0.4, 0.45], [0.4, 0.4]], False, "configuration")
     np.random.seed(5)

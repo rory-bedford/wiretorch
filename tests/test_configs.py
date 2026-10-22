@@ -15,7 +15,7 @@ def test_layer_config_outputs():
 
 
 def test_old_configs_with_tau_ref_still_parse():
-    from connectome_snns.configs.conductance_based import PhysiologyConfig
+    from wiretorch.configs.conductance_based import PhysiologyConfig
 
     config = PhysiologyConfig(
         tau_mem=20.0, theta=-50.0, U_reset=-60.0, E_L=-60.0, g_L=1.0, tau_ref=2.0
@@ -27,8 +27,8 @@ def test_unknown_keys_are_errors():
     import pytest
     from pydantic import ValidationError
 
-    from connectome_snns.configs import SimulationConfig
-    from connectome_snns.configs.conductance_based import PhysiologyConfig
+    from wiretorch.configs import SimulationConfig
+    from wiretorch.configs.conductance_based import PhysiologyConfig
 
     with pytest.raises(ValidationError, match="tau_memm"):
         PhysiologyConfig(
@@ -43,12 +43,12 @@ def _current_network(device="cpu", spikes_per_step=0.0, weight=0.02):
     import numpy as np
     import torch
 
-    from connectome_snns.configs.current_based import (
+    from wiretorch.configs.current_based import (
         FeedforwardLayerConfig,
         RecurrentLayerConfig,
     )
-    from connectome_snns.network_simulators.current import CurrentLIFNetwork
-    from connectome_snns.network_simulators.projections import FrozenProjection
+    from wiretorch.network_simulators.current import CurrentLIFNetwork
+    from wiretorch.network_simulators.projections import FrozenProjection
 
     physiology = dict(tau_mem=20.0, tau_syn=5.0, R=50.0, U_rest=-70.0, theta=-50.0, U_reset=-75.0)  # fmt: skip
     rec = RecurrentLayerConfig(

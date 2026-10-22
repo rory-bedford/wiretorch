@@ -3,8 +3,8 @@
 import numpy as np
 import torch
 
-from connectome_snns.training_utils.surrogate_gradients import SurrGradSpike
-from connectome_snns.training_utils.weight_perturbers import (
+from wiretorch.training_utils.surrogate_gradients import SurrGradSpike
+from wiretorch.training_utils.weight_perturbers import (
     perturb_weights_scaling_factor,
 )
 
@@ -37,7 +37,7 @@ def test_surrogate_spike():
 
 
 def test_calcium_model_matches_its_recurrence():
-    from connectome_snns.observation_models.calcium import CalciumObservationModel
+    from wiretorch.observation_models.calcium import CalciumObservationModel
 
     torch.manual_seed(0)
     gain = torch.rand(6) + 0.5
@@ -58,7 +58,7 @@ def test_calcium_model_matches_its_recurrence():
 def test_async_logger_columns(tmp_path):
     import pandas as pd
 
-    from connectome_snns.training_utils import AsyncLogger
+    from wiretorch.training_utils import AsyncLogger
 
     logger = AsyncLogger(tmp_path)
     logger.log(epoch=1, b=1.0)
@@ -76,7 +76,7 @@ def test_async_logger_columns(tmp_path):
 
 
 def test_load_checkpoint_from_directory_takes_latest(tmp_path):
-    from connectome_snns.training_utils.checkpointing import (
+    from wiretorch.training_utils.checkpointing import (
         load_checkpoint,
         save_checkpoint,
     )
@@ -117,7 +117,7 @@ def test_async_plotter_leaves_plot_data_alone(tmp_path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    from connectome_snns.training_utils import AsyncPlotter
+    from wiretorch.training_utils import AsyncPlotter
 
     received = {}
 

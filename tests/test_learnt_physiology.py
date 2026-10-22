@@ -86,8 +86,8 @@ def test_conductance_learn_trains_exactly_what_it_names():
         "synapse_parameters.log_g_bar",
     }
     assert parameters["cell_parameters.log_g_L"].shape == (1,)  # inhibitory only
-    # The recurrent and input NMDA differ (tau_decay 60 and 70), so the registry holds
-    # two synapse types of that name, and naming it learns both.
+    # NMDA is made by the excitatory neurons and by the mitral inputs: two synapse types
+    # of that name (a type is its source cell type and name), and naming it learns both.
     assert parameters["synapse_parameters.log_tau_decay"].shape == (2,)
 
     fixed = recurrent(BATCH_SIZE, SEED, scaling_factors=True).model
@@ -128,7 +128,7 @@ def _kernels_vs_reference(builder, monkeypatch, warm_up=30, steps=60):
     """
     results = []
     for backend in ("triton", "torch"):
-        monkeypatch.setenv("CONNECTOME_SNNS_BACKEND", backend)
+        monkeypatch.setenv("WIRETORCH_BACKEND", backend)
         built = builder()
         model = built.model.to("cuda")
         rng = np.random.default_rng(1)

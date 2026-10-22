@@ -33,7 +33,7 @@ def test_training_trajectory():
 def test_plot_data_concatenates_lazily():
     from collections import deque
 
-    from connectome_snns.snn_runners.trainer import PlotData
+    from wiretorch.snn_runners.trainer import PlotData
 
     chunks = {
         "spikes": deque([np.zeros((1, 2, 3)), np.ones((1, 4, 3))]),
@@ -105,7 +105,7 @@ def test_resume_matches_uninterrupted(tmp_path, at, checkpoint_interval):
 def test_resume_with_load_checkpoint(tmp_path):
     """The two-call resume (``load_checkpoint``, ``set_checkpoint_state``) is exact at a
     data-epoch boundary, where the losses' state is reset anyway."""
-    from connectome_snns.training_utils.checkpointing import load_checkpoint
+    from wiretorch.training_utils.checkpointing import load_checkpoint
 
     whole = _train_keeping(tmp_path, 5, checkpoint_interval=5, chunks_per_update=1)
     resumed, _, _ = training_setup(scheduler=True, chunks_per_update=1)
@@ -138,7 +138,7 @@ def test_interrupted_save_keeps_the_last_checkpoint(tmp_path, monkeypatch):
     """A job killed while writing a checkpoint leaves the previous one loadable."""
     import torch
 
-    from connectome_snns.training_utils import checkpointing
+    from wiretorch.training_utils import checkpointing
 
     trainer, _, _ = training_setup(checkpoint_interval=4)
     trainer.train(output_dir=tmp_path)
@@ -201,8 +201,8 @@ def test_prefetcher_hands_out_every_batch_in_order(device):
     stops, even while the consumer overwrites what it was given."""
     import torch
 
-    from connectome_snns.dataloaders.supervised import SpikeData
-    from connectome_snns.snn_runners.chunks import Prefetcher
+    from wiretorch.dataloaders.supervised import SpikeData
+    from wiretorch.snn_runners.chunks import Prefetcher
 
     batches = [
         SpikeData(

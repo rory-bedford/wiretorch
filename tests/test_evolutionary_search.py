@@ -3,8 +3,8 @@
 import numpy as np
 import torch
 
-from connectome_snns.snn_runners import EvolutionarySearch
-from connectome_snns.training_utils.losses import VanRossumLoss
+from wiretorch.snn_runners import EvolutionarySearch
+from wiretorch.training_utils.losses import VanRossumLoss
 from fixtures.generate import training_setup
 
 

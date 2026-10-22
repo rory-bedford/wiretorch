@@ -1,123 +1,58 @@
-# Connectome-Constrained SNN Models
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/_static/logo.png" alt="wiretorch" width="260">
+</p>
 
-[![tests](https://github.com/rory-bedford/connectome-snns/actions/workflows/tests.yml/badge.svg)](https://github.com/rory-bedford/connectome-snns/actions/workflows/tests.yml)
-[![inference](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/connectome-snns/main/docs/badges/inference.json)](docs/performance.md)
-[![training](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/connectome-snns/main/docs/badges/training.json)](docs/performance.md)
-[![Python 3.13+](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.7+](https://img.shields.io/badge/pytorch-2.7+-ee4c2c.svg)](https://pytorch.org/)
-[![Ruff](https://img.shields.io/badge/linting-ruff-261230.svg)](https://docs.astral.sh/ruff/)
-[![uv](https://img.shields.io/badge/packaging-uv-de5fe9.svg)](https://docs.astral.sh/uv/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+<h1 align="center">wiretorch</h1>
 
-![Overview](assets/header.svg)
+<p align="center">
+  <a href="https://wiretorch.readthedocs.io"><img src="https://readthedocs.org/projects/wiretorch/badge/?version=latest" alt="docs"></a>
+  <a href="https://pypi.org/project/wiretorch/"><img src="https://img.shields.io/pypi/v/wiretorch.svg" alt="PyPI"></a>
+  <a href="https://github.com/rory-bedford/wiretorch/actions/workflows/tests.yml"><img src="https://github.com/rory-bedford/wiretorch/actions/workflows/tests.yml/badge.svg" alt="tests"></a>
+  <a href="https://codecov.io/gh/rory-bedford/wiretorch"><img src="https://codecov.io/gh/rory-bedford/wiretorch/graph/badge.svg" alt="coverage"></a>
+  <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/inference.json" alt="inference speed"></a>
+  <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/training.json" alt="training speed"></a>
+  <a href="https://github.com/rory-bedford/wiretorch/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT license"></a>
+</p>
 
-PyTorch-based **library** for modelling dynamical connectomics datasets with
-spiking neural networks (SNNs). Given a connectome (a wiring diagram of neural
-connections), it builds SNN models that respect the observed connectivity and
-trains them to reproduce experimentally recorded neural activity.
+wiretorch builds neural network models from connectomes in PyTorch. You give it a
+wiring diagram and the cell type of each neuron, and it builds a network with exactly
+that connectivity. The networks run on GPUs with custom kernels and are differentiable,
+so they can be trained with any loss: matching recorded spikes, rates or calcium
+signals, performing a task, or anything else you can write in PyTorch.
 
-This is a **library**, not an experiment repo: experiments live in separate
-project repos that install it as a dependency. The package is importable as
-`connectome_snns`.
+It supports a range of single-neuron models, including conductance- and current-based
+spiking neurons and rate neurons. Weights can be fixed, scaled per cell-type pair,
+factorised or learnt one by one, and physiological parameters such as time constants
+and thresholds can be learnt too.
 
-## What it provides
+## Installation
 
-- **Network simulators** for current- and conductance-based spiking neurons, in recurrent and feedforward configurations (`connectome_snns.network_simulators`)
-- **Topology generators** for synthetic connectomes with configurable statistics (`connectome_snns.synthetic_connectome`)
-- **Training & inference** loops, including an approximate EM algorithm for partially observed networks (`connectome_snns.snn_runners`, `connectome_snns.training_utils`)
-- **Dataloaders** for supervised/unsupervised teacher activity and OU-mixed input patterns (`connectome_snns.dataloaders`)
-- **Analysis & visualization** — spike statistics, parameter recovery, plotting (`connectome_snns.analysis`, `connectome_snns.visualization`)
-- **A reproducibility run framework** — `connectome_snns.run_experiment` / `run_grid_search` + `connectome_snns.utils.reproducibility`
+Install [PyTorch](https://pytorch.org/get-started/locally/) first, choosing the CUDA
+version your driver supports (`nvidia-smi` shows it), then wiretorch:
 
-## Structure
-
-```
-src/connectome_snns/
-  network_simulators/   # the SNN models
-    conductance/        #   conductance-based networks: recurrent.py, feedforward.py,
-                        #   and their engine: network.py (pathways, state), dynamics.py
-                        #   (the time step, PyTorch), kernels.py (the same step, Triton),
-                        #   engine.py
-    current/            #   current-based networks: recurrent.py, feedforward.py, and
-                        #   their shared base, network.py
-    projections.py  two_layer.py
-  snn_runners/          # SNNTrainer, SNNInference, CMA-ES; chunks.py (shared plumbing)
-  training_utils/       # losses, filtering, surrogate gradients, logging, checkpoints
-  dataloaders/          # teacher datasets, Poisson inputs, rate processes
-  analysis/             # firing statistics, metrics, test inputs
-  visualization/        # plotting helpers and colour palettes
-  synthetic_connectome/ # synthetic connectivity generators
-  configs/  observation_models/  utils/
-  run_experiment.py  run_grid_search.py   # the run framework
-tests/                  # the test suite and its recorded fixtures (tests/README.md)
-benchmarks/speed.py     # simulator speed on a teacher-sized network
-docs/performance.md     # how the speed got where it is
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu129
+pip install wiretorch            # or "wiretorch[wandb]" to log to Weights & Biases
 ```
 
-On a CUDA device the conductance-based networks run fused Triton kernels (one launch
-per chunk for feedforward networks, two per step for recurrent ones, with a matching
-reverse-time kernel for gradients); elsewhere they run the PyTorch reference, which
-is also their specification.
-
-## Use as a dependency
-
-Project repos install it as a dependency (pin to a git rev for archival
-reproducibility). Because torch is kept in optional extras, the base install
-pulls no torch; consumers that need it own the torch index choice. For local
-development alongside a project repo, an editable path dependency works well:
-
-```toml
-[project]
-dependencies = ["connectome-snns"]
-
-[tool.uv.sources]
-connectome-snns = { path = "../connectome-snns", editable = true }
-```
-
-Then in code:
+Without the first step pip installs PyPI's default PyTorch, a CUDA 13 build that needs
+a recent driver. The [installation guide](https://wiretorch.readthedocs.io/en/latest/getting-started/install.html)
+explains how to choose, and which GPUs are supported.
 
 ```python
-from connectome_snns.utils.reproducibility import load_experiment_config
-from connectome_snns.snn_runners import SNNTrainer
-from connectome_snns import visualization
+import wiretorch as wt
 ```
 
-## Developing the library itself
+## Documentation
 
-We use [uv](https://docs.astral.sh/uv/). Sync with the extra matching the machine:
+[wiretorch.readthedocs.io](https://wiretorch.readthedocs.io) has a
+[quickstart](https://wiretorch.readthedocs.io/en/latest/getting-started/quickstart.html),
+[tutorials](https://wiretorch.readthedocs.io/en/latest/tutorials/index.html) (a ring
+attractor, a spiking network on a synthetic connectome, fitting connection strengths
+and physiology), and the
+[API reference](https://wiretorch.readthedocs.io/en/latest/api/index.html).
+Setting up a development environment and running the tests is described under
+[Development](https://wiretorch.readthedocs.io/en/latest/development.html).
 
-```bash
-uv sync --extra cpu       # CPU
-uv sync --extra cu129     # GPU (CUDA 12.9)
-```
-
-The run framework drives experiments from the *consumer* repos via their `./run`
-wrappers (`python -m connectome_snns.run_experiment <config.toml>`), which check
-for a clean commit then snapshot the commit hash, parameters, and input data
-alongside the results — each output folder is self-contained and reproducible.
-
-## Development
-
-Run the test suite (GPU tests skip without CUDA; see [`tests/README.md`](tests/README.md)
-for what "correct" means for a chaotic simulator):
-
-```bash
-uv sync --extra cu129 --group dev
-uv run --extra cu129 pytest   # name the extra: uv run re-syncs to it
-```
-
-The speed badges come from `python benchmarks/speed.py --badges` (on a Quadro RTX
-5000; seconds of wall time per second of simulated network time, batch of 50 trials);
-[`docs/performance.md`](docs/performance.md) logs how they got there.
-
-Install the git hooks: ruff (lint + format) on every commit, and the full test suite
-before every push — the only place the GPU tests run, since GitHub's CI (CPU only,
-`pytest -m "not gpu"`, on every push) has no GPU:
-
-```bash
-uv run --no-sync pre-commit install
-```
-
-Commit messages start with a [gitmoji](https://gitmoji.dev/) (e.g. `:sparkles:`,
-`:bug:`, `:recycle:`). Since project repos depend on this one, prefer
-**additive** changes and flag breaking API changes.
+wiretorch used to be called `connectome_snns`. That name still imports, with a
+deprecation warning.

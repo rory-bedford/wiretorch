@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from connectome_snns.analysis.firing_statistics import compute_spike_train_cv
+from wiretorch.analysis.firing_statistics import compute_spike_train_cv
 
 
 def cv_by_definition(trains, dt):
@@ -27,11 +27,11 @@ def test_spike_train_cv(shape):
 
 
 def test_statistics_by_cell_type():
-    from connectome_snns.analysis.firing_statistics import (
+    from wiretorch.analysis.firing_statistics import (
         compute_cv_by_cell_type,
         compute_firing_rate_by_cell_type,
     )
-    from connectome_snns.analysis.voltage_statistics import (
+    from wiretorch.analysis.voltage_statistics import (
         compute_membrane_potential_by_cell_type,
     )
 

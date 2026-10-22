@@ -226,3 +226,4 @@ activate
 # Speed benchmarks: the script is tracked, its results and caches are not
 benchmarks/*
 !benchmarks/speed.py
+docs/api/reference/

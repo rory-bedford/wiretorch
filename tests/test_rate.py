@@ -18,13 +18,13 @@ import torch
 
 import fixture_io
 import harness
-from connectome_snns.network_simulators.projections import FrozenProjection
-from connectome_snns.network_simulators.rate import (
+from wiretorch.network_simulators.projections import FrozenProjection
+from wiretorch.network_simulators.rate import (
     NONLINEARITIES,
     RecurrentRateNetwork,
     filter_rates,
 )
-from connectome_snns.network_simulators.rate.dynamics import Physiology, rates
+from wiretorch.network_simulators.rate.dynamics import Physiology, rates
 from networks import BATCH_SIZE, DT, SCENARIOS, per_type_blocks
 
 RATE = [name for name, s in SCENARIOS.items() if s.rates]
@@ -134,7 +134,11 @@ def test_tracking_does_not_change_dynamics(name, device):
     model.track_variables, model.track_batch_idx = True, 0
     with torch.no_grad():
         tracked = model(x[:, :50])
-    np.testing.assert_array_equal(tracked["rates"].cpu().numpy(), plain[:, :50])
+    # Tracking compiles a separate kernel, which may round differently.
+    tol = SELF_TOLERANCE[device]
+    np.testing.assert_allclose(
+        tracked["rates"].cpu().numpy(), plain[:, :50], rtol=tol, atol=tol
+    )
     assert tracked["voltages"].shape == (1, 50, model.n_neurons)
 
 
@@ -364,7 +368,7 @@ def _kernels_vs_reference(builder, monkeypatch, steps=60):
     both on the GPU from the same network."""
     results = []
     for backend in ("triton", "torch"):
-        monkeypatch.setenv("CONNECTOME_SNNS_BACKEND", backend)
+        monkeypatch.setenv("WIRETORCH_BACKEND", backend)
         built = builder()
         model = built.model.to("cuda")
         x = torch.from_numpy(built.input_spikes[:, :steps]).to("cuda")

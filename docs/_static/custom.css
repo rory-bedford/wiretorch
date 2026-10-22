@@ -1,0 +1,12 @@
+/* Tutorial figures come in a light and a dark version (wiretorch.visualization.theme):
+   show the one that matches the page. Furo sets data-theme on body; "auto" follows
+   the system, as the figures' own style does. */
+body[data-theme="light"] .wt-figure .wt-light { display: inline !important; }
+body[data-theme="light"] .wt-figure .wt-dark { display: none !important; }
+body[data-theme="dark"] .wt-figure .wt-light { display: none !important; }
+body[data-theme="dark"] .wt-figure .wt-dark { display: inline !important; }
+
+/* Space between a figure and the text or code above and below it. */
+.wt-figure { display: block; margin: 1.75rem 0 1.25rem; }
+
+.sidebar-logo { max-width: 70%; }

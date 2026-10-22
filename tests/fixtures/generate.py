@@ -96,9 +96,9 @@ def training_setup(
     external input and spikes. The defaults are the configuration ``training.npz`` was
     recorded with. (The logged stats keep the names ``training_log.npz`` recorded.)
     """
-    from connectome_snns.dataloaders.supervised import SpikeData
-    from connectome_snns.snn_runners import SNNTrainer
-    from connectome_snns.training_utils.losses import VanRossumLoss
+    from wiretorch.dataloaders.supervised import SpikeData
+    from wiretorch.snn_runners import SNNTrainer
+    from wiretorch.training_utils.losses import VanRossumLoss
     from torch.amp import GradScaler
 
     source = recurrent(BATCH_SIZE, SEED)
@@ -242,7 +242,7 @@ def stats_run(name, input_seed, device="cuda", compile=False, storage_dtype="flo
 
 def record_statistics(fixture="statistics"):
     names, backend = STATS_FIXTURES[fixture]
-    os.environ["CONNECTOME_SNNS_BACKEND"] = backend
+    os.environ["WIRETORCH_BACKEND"] = backend
     arrays, fingerprints = {}, {}
     for name in names:
         for seed in STATS_INPUT_SEEDS:
@@ -303,7 +303,7 @@ def config_outputs():
     network of the teacher-student experiments)."""
     import json
 
-    from connectome_snns.configs.conductance_based import (
+    from wiretorch.configs.conductance_based import (
         FeedforwardLayerConfig,
         RecurrentLayerConfig,
     )
