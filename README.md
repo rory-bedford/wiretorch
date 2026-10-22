@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://wiretorch.readthedocs.io"><img src="https://img.shields.io/readthedocs/wiretorch?logo=readthedocs&logoColor=white" alt="docs"></a>
-  <a href="https://pypi.org/project/wiretorch/"><img src="https://img.shields.io/pypi/v/wiretorch?logo=pypi&logoColor=white" alt="PyPI"></a>
+  <a href="https://pypi.org/project/wiretorch/"><img src="https://img.shields.io/pypi/v/wiretorch" alt="PyPI"></a>
   <a href="https://github.com/rory-bedford/wiretorch/actions/workflows/ci.yml"><img src="https://github.com/rory-bedford/wiretorch/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://codecov.io/gh/rory-bedford/wiretorch"><img src="https://codecov.io/gh/rory-bedford/wiretorch/graph/badge.svg" alt="coverage"></a>
   <a href="https://wiretorch.readthedocs.io/en/latest/performance.html"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/rory-bedford/wiretorch/main/docs/badges/inference.json&logo=nvidia&logoColor=white" alt="inference speed"></a>
