@@ -5,7 +5,7 @@
 <h1 align="center">wiretorch</h1>
 
 <p align="center">
-  <a href="https://wiretorch.readthedocs.io"><img src="https://readthedocs.org/projects/wiretorch/badge/?version=latest" alt="docs"></a>
+  <a href="https://wiretorch.readthedocs.io"><img src="https://img.shields.io/readthedocs/wiretorch" alt="docs"></a>
   <a href="https://pypi.org/project/wiretorch/"><img src="https://img.shields.io/pypi/v/wiretorch.svg" alt="PyPI"></a>
   <a href="https://github.com/rory-bedford/wiretorch/actions/workflows/tests.yml"><img src="https://github.com/rory-bedford/wiretorch/actions/workflows/tests.yml/badge.svg" alt="tests"></a>
   <a href="https://codecov.io/gh/rory-bedford/wiretorch"><img src="https://codecov.io/gh/rory-bedford/wiretorch/graph/badge.svg" alt="coverage"></a>
