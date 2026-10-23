@@ -30,6 +30,12 @@ The release notes of each version on GitHub are taken from its section here.
   ones, as in Brunel & Wang's (2001) NMDA. Its `g_bar` is then the conductance with every
   receptor open. The gating is part of the state and the checkpoints; Triton kernels for
   every path.
+- Short-term depression and facilitation (Tsodyks–Markram) in both spiking families:
+  `rec_stp` / `ff_stp` (feedforward networks: `stp`) give `STP(U, tau_D, tau_F)` per
+  (source, target) cell type pair, with `wt.stp.DEPRESSING` and `wt.stp.FACILITATING`
+  presets. A spike's input is its release over `U`, so a first spike from rest keeps its
+  weight. Release drives a saturating synapse type's receptors. Triton kernels for every
+  path.
 
 ## [0.1.0b1] - 2026-10-22
 

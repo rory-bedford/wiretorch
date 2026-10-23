@@ -8,10 +8,11 @@ Feedforward input is known for a whole chunk, so its synaptic drive — every pa
 input times its weights — is computed up front by ``activations``: dense matmuls, or one
 cuSPARSE product per pathway when the input is sparse (spike trains).
 
-A saturating pathway's input (see ``network.gate_step``) is its rows times their
-factors: ``gate_feedforward`` steps the feedforward gating through a chunk on the GPU.
-Such a pathway shares its weight rows with its cell type's other pathway, so the
-recurrent weights are laid out once per source (``recurrent_weights``).
+A pathway with presynaptic dynamics (see ``network.gate_step``) has as input its rows
+times their factors: ``gate_feedforward`` steps the feedforward ones through a chunk on
+the GPU, and ``Gating`` holds the recurrent ones' tables for the kernels. Pathways of
+one source cell type share its weight rows, so the recurrent weights are laid out once
+per source (``recurrent_weights``).
 
 A recurrent network's backward pass needs the gradient w.r.t. its recurrent weights
 (``weight_gradient``) and, when gradients flow through the recurrent spikes
@@ -25,6 +26,7 @@ import functools
 import itertools
 import os
 import warnings
+from dataclasses import dataclass
 
 import torch
 
@@ -143,12 +145,12 @@ def activations(drive: Drive, x: torch.Tensor, factors=None) -> torch.Tensor:
     return A.view(len(rows), B, T, -1)
 
 
-GATE_BLOCK = 256  # gating columns per program of ``gate_scan``
+GATE_BLOCK = 256  # rows per program of ``gate_scan``
 
 
 def gate_feedforward(drive: Drive, x: torch.Tensor, gating: torch.Tensor | None):
     """``network.gate_feedforward`` by the ``gate_scan`` kernel (CUDA), one launch per
-    saturating pathway; ``gating`` is updated in place."""
+    pathway with presynaptic dynamics; ``gating`` is updated in place."""
     K_rec = len(drive.recurrent)
     gates = [drive.gate(K_rec + k) for k in range(len(drive.feedforward))]
     if not any(gates):
@@ -164,15 +166,108 @@ def gate_feedforward(drive: Drive, x: torch.Tensor, gating: torch.Tensor | None)
         if gate is None:
             factors.append(None)
             continue
-        RG = rows.numel()
-        f = torch.empty((B, T, RG), device=x.device)
-        gate_scan[(triton.cdiv(B * RG, GATE_BLOCK),)](
-            x, rows.int().contiguous(), gate.saturation.expand(RG).contiguous(),
-            gate.decay.expand(RG).contiguous(), gating, f,
-            B, T, n_in, gating.shape[1], RG, gate.start, BLOCK=GATE_BLOCK,
+        f = torch.empty((B, T, gate.n), device=x.device)
+        stp_col, sat_col = _gate_columns(gate)
+        gate_scan[(triton.cdiv(B * gate.n, GATE_BLOCK),)](
+            x, rows.int().contiguous(), gate.params.float().contiguous(), gating, f,
+            B, T, n_in, gating.shape[1], gate.n, stp_col, sat_col,
+            BLOCK=GATE_BLOCK, STP=gate.stp, SATURATES=gate.saturates,
         )  # fmt: skip
         factors.append(f)
     return factors, gating
+
+
+def _gate_columns(gate) -> tuple[int, int]:
+    """A ``Gate``'s first columns of the gating state: STP's ``u`` (then ``x``) and
+    the receptors' gating, -1 where it has none."""
+    stp = gate.start if gate.stp else -1
+    saturation = gate.start + 2 * gate.n * gate.stp if gate.saturates else -1
+    return stp, saturation
+
+
+@dataclass
+class Gating:
+    """The recurrent pathways' presynaptic dynamics, as the kernels take them.
+
+    ``state`` ``(B, R)`` is the gating state (updated in place), ``params`` ``(K, 5)``
+    each pathway's ``Gate.params`` and ``cols`` ``(K, 3)`` int32 its columns of
+    ``state`` and of the factors saved for the backward pass ``(B, T, R_f)`` (see
+    ``compact_spikes``), -1 where it has none.
+    """
+
+    state: torch.Tensor
+    params: torch.Tensor
+    cols: torch.Tensor
+    R_f: int
+    f_cols: tuple[int, ...]
+
+    @property
+    def gated(self) -> bool:
+        """Whether a recurrent pathway has presynaptic dynamics (``GATED``)."""
+        return self.R_f > 0
+
+    def f_saved(self, B, T, dummy) -> torch.Tensor:
+        if not self.gated:
+            return dummy
+        return torch.empty((B, T, self.R_f), device=dummy.device)
+
+    def factors(self, f_saved, sizes) -> list | None:
+        """Per recurrent pathway, its factors ``(B, T, n_rows)`` (None if it has no
+        presynaptic dynamics), or None if none has."""
+        if not self.gated:
+            return None
+        return [
+            None if c < 0 else f_saved[:, :, c : c + n]
+            for c, n in zip(self.f_cols, sizes)
+        ]
+
+
+def gating_tables(drive: Drive, gating: torch.Tensor | None, dummy) -> Gating:
+    """The ``Gating`` of a call's recurrent pathways."""
+    params, cols, f_cols, R_f = [], [], [], 0
+    zero = torch.zeros(5, device=dummy.device)
+    for k in range(len(drive.recurrent)):
+        gate = drive.gate(k)
+        if gate is None:
+            params.append(zero)
+            cols.append((-1, -1, -1))
+            f_cols.append(-1)
+            continue
+        params.append(gate.params.float())
+        cols.append((*_gate_columns(gate), R_f))
+        f_cols.append(R_f)
+        R_f += gate.n
+    if not R_f:
+        return Gating(dummy, dummy, dummy, 0, tuple(f_cols))
+    return Gating(
+        gating,
+        torch.stack(params).contiguous(),
+        _int_table(tuple(cols), dummy.device),
+        R_f,
+        tuple(f_cols),
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _int_table(rows: tuple, device) -> torch.Tensor:
+    """``rows`` as a cached int32 tensor (see ``row_start``)."""
+    return torch.tensor(rows, dtype=torch.int32, device=device)
+
+
+def carry_to_sources(R, blocks, grad_A_t, factors, t, shared) -> None:
+    """``R`` ``(B, N)``: what each recurrent pathway's ``dL/da`` of step ``t`` passes
+    back to its source spikes (``presynaptic_blocks``), a presynaptic pathway's times
+    its factors. ``shared``: whether pathways share sources (then they add up)."""
+    if shared:
+        R.zero_()
+    for k, (source, carry) in enumerate(blocks):
+        r = carry(grad_A_t[k])
+        if factors is not None and factors[k] is not None:
+            r = r * factors[k][:, t]
+        if shared:
+            R.index_add_(1, source, r)
+        else:
+            R.index_copy_(1, source, r)
 
 
 def recurrent_weights(recurrent) -> tuple[torch.Tensor, tuple[int, ...]]:

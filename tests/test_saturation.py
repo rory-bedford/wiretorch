@@ -194,9 +194,9 @@ def test_recurrent_gating_follows_the_spikes(device):
         recurrent_side = model._sides[pathway.side].recurrent
         pre = (spikes if recurrent_side else x)[:, :, rows]
         decay = math.exp(-model.dt.item() / model.tau_decay[pathway.gate].item())
-        start, stop = model._gate_columns[pathway.index]
+        start, n = model._gate_columns[pathway.index]
         np.testing.assert_allclose(
-            model.gating[:, start:stop].cpu().numpy(),
+            model.gating[:, start : start + n].cpu().numpy(),
             _gating(pre, C, decay)[:, -1],
             rtol=1e-5,
             atol=1e-6,

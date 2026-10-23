@@ -127,6 +127,21 @@ def saturating(synapses, saturation):
     ]
 
 
+#: Short-term plasticity of the test networks (``stp=True``): depressing onto
+#: excitatory cells, facilitating onto inhibitory ones, so that a source cell type has
+#: two parameter sets (its rows are shared by two pathways).
+def stp_pairs(sources, recurrent_names=("excitatory", "inhibitory")):
+    """Depressing (source, excitatory) and facilitating (source, inhibitory) pairs."""
+    from wiretorch.network_simulators.stp import DEPRESSING, FACILITATING
+
+    excitatory, inhibitory = recurrent_names
+    pairs = {}
+    for source in sources:
+        pairs[(source, excitatory)] = DEPRESSING
+        pairs[(source, inhibitory)] = FACILITATING
+    return pairs
+
+
 def refractory(cells, tau_ref):
     """``cells`` with a refractory period of ``tau_ref`` ms (unchanged if None)."""
     return cells if tau_ref is None else [{**c, "tau_ref": tau_ref} for c in cells]
@@ -258,12 +273,14 @@ def recurrent(
     tau_ref=None,
     mg=None,
     saturation=None,
+    stp=False,
 ):
     """``ConductanceLIFNetwork`` with frozen weights or perturbed scaling factors, and
     the physiology ``learn`` names; ``learnt_weights`` makes the recurrent weights
     full-rank parameters (and the feedforward ones scaling factors), ``tau_ref`` (ms)
     gives every cell type a refractory period, ``mg`` (mM) the NMDA types a Mg block,
-    ``saturation`` makes them saturate."""
+    ``saturation`` makes them saturate; ``stp`` gives the excitatory and input sources
+    short-term plasticity (``stp_pairs``)."""
     rng, types, w_rec, w_ff = _structure(seed, n, n_ff)
     ff_types = np.zeros(n_ff, dtype=np.int64)
     if learnt_weights:
@@ -309,6 +326,8 @@ def recurrent(
         surrgrad_scale=5.0,
         batch_size=batch_size,
         learn=learn,
+        rec_stp=stp_pairs(["excitatory"]) if stp else None,
+        ff_stp=stp_pairs(["mitral"]) if stp else None,
     )
     sfs = (
         move_scaling_factors(rng, [*rec.values(), *ff.values()])
@@ -335,11 +354,13 @@ def feedforward(
     tau_ref=None,
     mg=None,
     saturation=None,
+    stp=False,
 ):
     """``FeedforwardConductanceLIFNetwork`` whose input rows are the external inputs and a
     ``recurrent`` network's neurons (as in teacher forcing), learning the physiology
     ``learn`` names, with a refractory period of ``tau_ref`` ms, a Mg block of ``mg``
-    mM on the NMDA types and their ``saturation`` if given.
+    mM on the NMDA types and their ``saturation`` if given, and with ``stp`` short-term
+    plasticity from the inputs and the excitatory rows (``stp_pairs``).
 
     Scaling factors on every pathway, or (``learnt_weights``) full-rank mitral, low-rank
     excitatory and scaling-factor inhibitory pathways — one of each caching mode.
@@ -383,6 +404,7 @@ def feedforward(
         batch_size=batch_size,
         return_probabilities=probabilities,
         learn=learn,
+        stp=stp_pairs(["mitral", "excitatory"]) if stp else None,
     )
     scaled = [p for p in projections.values() if isinstance(p, ScalingFactorProjection)]
     drawn["sf"] = move_scaling_factors(rng, scaled)
@@ -514,6 +536,7 @@ def current_recurrent(
     former=False,
     learn=None,
     tau_ref=None,
+    stp=False,
 ):
     """``CurrentLIFNetwork`` with learnt scaling factors (or ``optimisable`` weights),
     the physiology ``learn`` names, and a refractory period of ``tau_ref`` ms if given.
@@ -555,6 +578,8 @@ def current_recurrent(
         connectome_mask=w_rec != 0,
         feedforward_mask=w_ff != 0,
         learn=learn,
+        rec_stp=stp_pairs(["excitatory"]) if stp else None,
+        ff_stp=stp_pairs(["input_0"]) if stp else None,
     )
     input_rng = rng if input_seed is None else _input_rng(seed, input_seed)
     inputs = poisson(input_rng, batch_size, n_steps, [RATE_HZ["mitral"]] * n_ff)
@@ -613,7 +638,9 @@ CURRENT_INPUT_SYNAPSES = [
 CURRENT_RATE_HZ = {E: 11.0, I: 7.0}  # the current_recurrent regime's rates
 
 
-def current_feedforward_probabilities(batch_size, seed, learn=None, tau_ref=None):
+def current_feedforward_probabilities(
+    batch_size, seed, learn=None, tau_ref=None, stp=False
+):
     """``FeedforwardCurrentLIFNetwork`` returning spike probabilities (and learning the
     physiology ``learn`` names, with a refractory period of ``tau_ref`` ms if given).
 
@@ -648,6 +675,7 @@ def current_feedforward_probabilities(batch_size, seed, learn=None, tau_ref=None
         batch_size=batch_size,
         return_probabilities=True,
         learn=learn,
+        stp=stp_pairs(["mitral", "excitatory"]) if stp else None,
     )
     sfs = move_scaling_factors(rng, list(projections.values()))
     rates = [RATE_HZ["mitral"]] * N_FF + [CURRENT_RATE_HZ[t] for t in types]

@@ -130,11 +130,12 @@ def _kernels_vs_reference(builder, monkeypatch, warm_up=30, steps=60):
     digits, the reference's as much as the kernels': one that misses ``1e-3`` of its
     scale must then be as close as the reference to a float64 run of the reference.
     """
-    s_k, v_k, g_k = _gradients(builder, monkeypatch, "triton", warm_up, steps)
-    s_r, v_r, g_r = _gradients(builder, monkeypatch, "torch", warm_up, steps)
+    s_k, v_k, g_k, u_k = _gradients(builder, monkeypatch, "triton", warm_up, steps)
+    s_r, v_r, g_r, u_r = _gradients(builder, monkeypatch, "torch", warm_up, steps)
     assert s_r.sum() > 0
     torch.testing.assert_close(s_k, s_r, rtol=0, atol=0)
     torch.testing.assert_close(v_k, v_r, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(u_k, u_r, rtol=1e-5, atol=1e-6)  # presynaptic state
     assert g_k.keys() == g_r.keys() and g_k
     g_64 = None
     for key in g_r:
@@ -151,8 +152,9 @@ def _kernels_vs_reference(builder, monkeypatch, warm_up=30, steps=60):
 
 
 def _gradients(builder, monkeypatch, backend, warm_up, steps, float64=False):
-    """Spikes, final voltage and parameter gradients of ``_kernels_vs_reference``'s
-    run on ``backend``, in float64 if asked."""
+    """Spikes, final voltage, parameter gradients and presynaptic state (``gating``,
+    empty if none) of ``_kernels_vs_reference``'s run on ``backend``, in float64 if
+    asked."""
     monkeypatch.setenv("WIRETORCH_BACKEND", backend)
     built = builder()
     model = (built.model.double() if float64 else built.model).to("cuda")
@@ -176,7 +178,8 @@ def _gradients(builder, monkeypatch, backend, warm_up, steps, float64=False):
     grads = {
         k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None
     }
-    return out["spikes"].detach(), model.v.clone(), grads
+    gating = getattr(model, "gating", torch.zeros(0, device="cuda"))
+    return out["spikes"].detach(), model.v.clone(), grads, gating.clone()
 
 
 @pytest.mark.gpu

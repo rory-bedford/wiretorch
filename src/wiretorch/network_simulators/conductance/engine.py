@@ -8,9 +8,10 @@ the kernels of ``kernels.py``:
   input. Without gradients, long chunks are fed in blocks to bound memory.
 * A recurrent network takes two launches per step: ``compact_spikes`` lists who fired,
   ``recurrent_step`` gathers just those weight rows and integrates.
-* A saturating synapse type's pathway scales each spike by the fraction it opens
-  (``network.gate_step``): ``gate_feedforward`` steps the inputs' gating variables
-  through the chunk before the matmuls, ``compact_spikes`` the neurons' each step.
+* A pathway with presynaptic dynamics (short-term plasticity, a saturating synapse
+  type: ``network.gate_step``) scales each spike by a factor: ``gate_feedforward``
+  steps the inputs' state through the chunk before the matmuls, ``compact_spikes``
+  the neurons' each step.
 * With gradients, the forward pass saves the voltage, conductances and recurrent
   activations of every step, and ``scan_backward`` is the reverse-time adjoint — unless
   gradients flow through the recurrent spikes (``Drive.recurrent_gradients``), which
@@ -41,7 +42,10 @@ from wiretorch.network_simulators.engine import (  # noqa: F401 - re-exported
     SPARSE_INPUT,
     _SparseActivations,
     activations as _activations,
+    Gating,
+    carry_to_sources,
     gate_feedforward,
+    gating_tables,
     held_buffer,
     offsets_tensor,
     pad as _pad,
@@ -120,14 +124,8 @@ class _Launch:
     #: of it left, ``(B, N)`` int32 (updated in place): dummies if no neuron has one.
     n_ref: torch.Tensor | None = None
     counter: torch.Tensor | None = None
-    #: The gating state ``(B, R)`` (updated in place), or a dummy; per recurrent
-    #: pathway its saturation, decay and first gating column (-1 if it does not
-    #: saturate); and how many gating columns the recurrent pathways have.
-    gating: torch.Tensor | None = None
-    gate_saturation: torch.Tensor | None = None
-    gate_decay: torch.Tensor | None = None
-    gate_col: torch.Tensor | None = None
-    R_rec: int = 0
+    #: The recurrent pathways' presynaptic dynamics.
+    gating: Gating | None = None
 
     @property
     def K(self) -> int:
@@ -142,28 +140,6 @@ class _Launch:
     def mg_block(self) -> bool:
         """Whether any synapse type has a Mg block (the kernels' ``MG_BLOCK``)."""
         return self.p.mg_c is not None
-
-    @property
-    def gated(self) -> bool:
-        """Whether a recurrent pathway saturates (the kernels' ``GATED``)."""
-        return self.R_rec > 0
-
-    def f_saved(self) -> torch.Tensor:
-        """Where the forward pass keeps the recurrent gating's factors for the
-        backward pass: ``(B, T, R_rec)``, or a dummy."""
-        if not self.gated:
-            return self.dummy
-        return torch.empty((self.B, self.T, self.R_rec), device=self.dummy.device)
-
-    def factors(self, f_saved, sizes) -> list | None:
-        """Per recurrent pathway, its factors ``(B, T, n_rows)`` from ``f_saved``
-        (None if it does not saturate), or None if none does."""
-        if not self.gated:
-            return None
-        cols = self.gate_col.tolist()
-        return [
-            None if c < 0 else f_saved[:, :, c : c + n] for c, n in zip(cols, sizes)
-        ]
 
     def held(self) -> torch.Tensor:
         return held_buffer(self.B, self.T, self.N, self.refractory, self.dummy)
@@ -225,8 +201,6 @@ def _prepare(
         }
     n_ref, counter = refractory_tables(p.n_ref, refractory, dummy)
     unused = torch.zeros_like(p.E_syn.detach())  # Mg block tables when there is none
-    gates = [drive.gate(k) for k in range(len(drive.recurrent))]
-    R_rec = max((g.stop for g in gates if g is not None), default=0)
     return _Launch(
         B=B, T=T, N=N, S=S, SP=SP,
         K_rec=len(drive.recurrent), K_ff=len(drive.feedforward),
@@ -245,22 +219,8 @@ def _prepare(
         wants=tuple(getattr(p, name).requires_grad for name in PHYSIOLOGY),
         recurrent_gradients=drive.recurrent_gradients,
         n_ref=n_ref, counter=counter,
-        gating=dummy if gating is None else gating,
-        gate_saturation=_gate_table(gates, "saturation", dummy),
-        gate_decay=_gate_table(gates, "decay", dummy),
-        gate_col=torch.tensor(
-            [-1 if g is None else g.start for g in gates] or [-1],
-            dtype=torch.int32, device=x.device,
-        ),
-        R_rec=R_rec,
+        gating=gating_tables(drive, gating, dummy),
     )  # fmt: skip
-
-
-def _gate_table(gates, name, dummy) -> torch.Tensor:
-    """Per recurrent pathway, its gate's ``name`` (0 if it has none)."""
-    zero = torch.zeros((), device=dummy.device)
-    values = [zero if g is None else getattr(g, name) for g in gates]
-    return torch.stack(values).float().contiguous() if values else dummy
 
 
 def _neurons(p: Physiology):
@@ -309,8 +269,9 @@ def _recurrent(L, A_ff_blocks, W, w_offsets, rows, sizes, scale, v, g, spikes, s
         (max(L.K_rec, 1), L.B, capacity), dtype=torch.int32, device=v.device
     )
     counts = torch.zeros((max(L.K_rec, 1), L.B), dtype=torch.int32, device=v.device)
-    amps = torch.empty(lists.shape, device=v.device) if L.gated else L.dummy
-    R = L.gating.shape[1] if L.gated else 0
+    gates = L.gating
+    amps = torch.empty(lists.shape, device=v.device) if gates.gated else L.dummy
+    R = gates.state.shape[1] if gates.gated else 0
     dt, surr = L.p.dt, L.p.surr_scale
     for t0, A_ff in A_ff_blocks:
         T_ff = A_ff.shape[2]
@@ -319,10 +280,10 @@ def _recurrent(L, A_ff_blocks, W, w_offsets, rows, sizes, scale, v, g, spikes, s
             if L.K_rec:
                 kernels.compact_spikes[(L.B, L.K_rec)](
                     v, L.p.theta, L.noise, L.counter, rows, row_start, lists, counts,
-                    L.gate_saturation, L.gate_decay, L.gate_col, L.gating, amps,
-                    f_saved, surr, t, L.B, L.T, L.N, capacity, R, L.R_rec,
+                    gates.params, gates.cols, gates.state, amps, f_saved,
+                    surr, t, L.B, L.T, L.N, capacity, R, gates.R_f,
                     BLOCK=COMPACT_BLOCK, SAMPLE=L.sample, REFRACTORY=L.refractory,
-                    GATED=L.gated, SAVE=bool(saved),
+                    GATED=gates.gated, SAVE=bool(saved),
                 )  # fmt: skip
             kernels.recurrent_step[(L.B, triton.cdiv(L.N, STEP_BLOCK))](
                 A_ff, W, w_start, lists, amps, counts, scale, L.made, L.jump, L.decay,
@@ -333,7 +294,7 @@ def _recurrent(L, A_ff_blocks, W, w_offsets, rows, sizes, scale, v, g, spikes, s
                 K_REC=L.K_rec, K_FF=L.K_ff, S=L.S, SP=L.SP,
                 BLOCK=STEP_BLOCK, ROWS=GATHER_ROWS,
                 SAVE=bool(saved), TRACK=L.tracked is not None, SAMPLE=L.sample,
-                REFRACTORY=L.refractory, MG_BLOCK=L.mg_block, GATED=L.gated,
+                REFRACTORY=L.refractory, MG_BLOCK=L.mg_block, GATED=gates.gated,
             )  # fmt: skip
 
 
@@ -370,7 +331,7 @@ def _recurrent_backward(
     returns ``(grad_A, grad_scale, *physiology)``.
 
     ``grad_A`` ``(K, B, T, N)`` is always computed: its recurrent part is what reaches
-    the presynaptic spikes (a saturating pathway's times its ``factors``).
+    the presynaptic spikes (a presynaptic pathway's times its ``factors``).
     ``grad_scale`` and the physiology are None unless wanted. ``saved`` is
     ``(spikes, v_saved, G_saved, g_init, held)``.
     """
@@ -388,7 +349,6 @@ def _recurrent_backward(
     flags = L.flags()
     want_theta = flags.pop("WANT_THETA")
     blocks = presynaptic_blocks(W, rows, sizes, L.p.storage_dtype, w_offsets)
-    factors = factors or [None] * len(blocks)
     shared = len(set(w_offsets)) < len(w_offsets)  # sources in more than one pathway
     grad_spikes = grad_spikes.contiguous()
     for t in reversed(range(L.T)):
@@ -399,16 +359,7 @@ def _recurrent_backward(
             K=L.K, S=L.S, SP=L.SP, BLOCK=block, WANT_SCALE=want_scale, **flags,
             REFRACTORY=L.refractory, MG_BLOCK=L.mg_block,
         )  # fmt: skip
-        if shared:
-            R.zero_()
-        for k, (source, carry) in enumerate(blocks):
-            r = carry(grad_A[k, :, t])
-            if factors[k] is not None:
-                r = r * factors[k][:, t]
-            if shared:
-                R.index_add_(1, source, r)
-            else:
-                R.index_copy_(1, source, r)
+        carry_to_sources(R, blocks, grad_A[:, :, t], factors, t, shared)
         kernels.spike_backward[grid](
             lv, v_saved, held, grad_spikes, R, L.p.theta, g_theta, L.p.surr_scale,
             t, L.B, L.T, L.N, BLOCK=block, SAMPLE=L.sample, WANT_THETA=want_theta,
@@ -475,7 +426,7 @@ class _RecurrentRun(torch.autograd.Function):
         )
         A_rec = torch.empty((L.K_rec, L.B, L.T, L.N), device=A_ff.device)
         held = L.held()
-        f_saved = L.f_saved()
+        f_saved = L.gating.f_saved(L.B, L.T, L.dummy)
         g_init = L.g_init(g)
         _recurrent(
             L, [(0, A_ff)], W, w_offsets, rows, sizes, scale, v, g, spikes,
@@ -497,7 +448,7 @@ class _RecurrentRun(torch.autograd.Function):
             ctx.saved_tensors
         )
         L, w_offsets, rows, sizes = ctx.L, ctx.w_offsets, ctx.rows, ctx.sizes
-        factors = L.factors(f_saved, sizes)
+        factors = L.gating.factors(f_saved, sizes)
         want_ff, want_scale, want_W = ctx.needs_input_grad[:3]
         if grad_spikes is None:
             grad_spikes = torch.zeros_like(spikes)

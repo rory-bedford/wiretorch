@@ -16,11 +16,13 @@ projections, which decides what is computed when:
   call, so gradients reach their parameters (``FullRankProjection``,
   ``LowRankProjection`` and subclasses).
 
-A synapse type can **saturate** (conductance-based networks): each source neuron then
-keeps a gating variable per such type, the fraction of its receptors that are open,
-and a spike opens only a fraction of those still closed (see ``gate_step``). Such a
-type gets a pathway of its own, sharing the rows and weights of its source cell type's
-pathway, whose activation is each spike times the fraction it opens.
+A pathway can have **presynaptic dynamics** that scale each spike's input by a factor
+from its source neuron's own state (``gate_step``): short-term plasticity of release,
+set per (source, target) cell type pair (``stp.STP``), and the saturation of a synapse
+type's receptors (conductance-based networks). Each combination of synapse types,
+saturating type and STP a source cell type has gets a pathway of its own, sharing its
+rows and weights; one restricted to some target cell types has zero ``scale`` for the
+others.
 
 What a family adds is its physiology: the per-neuron and per-synapse tables, the
 synaptic state, and an ``engine`` whose ``simulate`` runs the time steps (each
@@ -37,6 +39,7 @@ from torch import nn
 
 from wiretorch.network_simulators.checkpoint_compat import drop_legacy_buffers
 from wiretorch.network_simulators.projections import Projection
+from wiretorch.network_simulators.stp import STP, as_stp
 from wiretorch.network_simulators.synapses import SynapseRegistry
 from wiretorch.network_simulators.type_parameters import (
     TypeParameters,
@@ -60,6 +63,8 @@ class InputSide:
         recurrent: Whether the sources are the network's own neurons.
         attribute: Name of the ``nn.ModuleDict`` holding the projections.
         mask_buffer: Name of the buffer holding the side's connectivity mask.
+        stp: Short-term plasticity per ``(source_name, target_name)`` pair (``STP``s,
+            or dicts of their fields); pairs not named have none.
     """
 
     projections: dict[PairKey, Projection]
@@ -69,14 +74,17 @@ class InputSide:
     recurrent: bool
     attribute: str
     mask_buffer: str
+    stp: dict | None = None
 
 
 @dataclass(frozen=True)
 class Pathway:
     """One source cell type on one input side (see the module docstring).
 
-    A saturating synapse type's pathway has its index as ``gate``, and shares the rows
-    and weights of the pathway ``source`` (its cell type's first; itself otherwise).
+    It shares the rows and weights of the pathway ``source`` (its cell type's first;
+    itself otherwise). A saturating synapse type's pathway has its index as ``gate``;
+    one with short-term plasticity its ``stp``, and the target cell types it reaches as
+    ``targets`` (None: every type).
     """
 
     index: int
@@ -85,6 +93,13 @@ class Pathway:
     mode: str  # "fixed" | "scaling_factors" | "weights"
     source: int
     gate: int | None = None
+    stp: STP | None = None
+    targets: tuple[int, ...] | None = None
+
+    @property
+    def presynaptic(self) -> bool:
+        """Whether its spikes are scaled by presynaptic dynamics."""
+        return self.gate is not None or self.stp is not None
 
 
 @dataclass
@@ -98,10 +113,10 @@ class Drive:
     ``made`` ``(K, S)`` marks the synapse types each pathway makes; ``scale`` ``(K, N)``
     multiplies its kernel per target neuron (a scaling factor, or 1).
 
-    A saturating synapse type's pathway (see the module docstring) shares its rows and
-    weights — the same tensors — with its cell type's other pathway, and has a
-    ``gates`` entry: its ``saturation`` and the per-step ``decay`` of its gating
-    variables, and the columns of the gating state ``(B, R)`` that hold them.
+    Pathways of one source cell type share its rows and weights — the same tensors. One
+    with presynaptic dynamics (see the module docstring) has a ``gates`` entry, its
+    ``Gate``: their parameters and the columns of the gating state ``(B, R)`` that hold
+    their variables.
     """
 
     made: torch.Tensor
@@ -113,7 +128,7 @@ class Drive:
     #: Whether gradients flow through the recurrent spikes, into the presynaptic
     #: neurons' surrogates; if not, the recurrent activations are treated as input.
     recurrent_gradients: bool = False
-    #: Per pathway (recurrent first), its ``Gate`` if it saturates, else None.
+    #: Per pathway (recurrent first), its ``Gate`` if it has presynaptic dynamics.
     gates: list[Gate | None] = field(default_factory=list)
 
     def gate(self, k: int) -> Gate | None:
@@ -121,7 +136,7 @@ class Drive:
 
     @property
     def gated(self) -> bool:
-        """Whether any pathway saturates."""
+        """Whether any pathway has presynaptic dynamics."""
         return any(g is not None for g in self.gates)
 
     def feedforward_activations(
@@ -144,38 +159,74 @@ class Drive:
 
 @dataclass(frozen=True)
 class Gate:
-    """A saturating pathway's gating: ``saturation`` and per-step ``decay`` (0-d
-    tensors), and its columns ``start:stop`` of the gating state."""
+    """A pathway's presynaptic dynamics, over its ``n`` source rows.
 
-    saturation: torch.Tensor
-    decay: torch.Tensor
+    ``params`` ``(5,)``: the saturation ``c`` and per-step decay of the receptors'
+    gating, the release probability at rest ``U``, and the per-step decays of the
+    resources' deficit and of the facilitation (see ``gate_step``). Its columns of the
+    gating state, from ``start``: with ``stp`` the release probabilities ``u`` and the
+    resources ``x`` (``n`` each), then if it ``saturates`` the receptors' gating ``g``.
+    """
+
+    params: torch.Tensor
+    stp: bool
+    saturates: bool
     start: int
-    stop: int
+    n: int
+
+    @property
+    def width(self) -> int:
+        return self.n * (2 * self.stp + self.saturates)
 
     @property
     def columns(self) -> slice:
-        return slice(self.start, self.stop)
+        return slice(self.start, self.start + self.width)
 
 
-def gate_step(u, s, gate: Gate):
-    """One step of a pathway's gating variables ``u`` ``(B, n_rows)`` given its source
-    neurons' spikes ``s``: they decay, then each spike opens the fraction
-    ``saturation`` of the receptors still closed,
+def gate_step(state, s, gate: Gate):
+    """One step of a pathway's presynaptic variables ``state`` ``(B, width)`` (see
+    ``Gate``) given its source neurons' spikes ``s`` ``(B, n)``. Returns ``(f,
+    state)``: ``s f`` is the pathway's input, in place of ``s``.
 
-        f = saturation (1 - decay u),    u <- min(decay u + s f, 1).
+    Short-term plasticity (Markram, Wang & Tsodyks 1998): the resources recover and the
+    release probability relaxes, then a spike releases ``r = u x``,
 
-    Returns ``(f, u)``: ``s f`` is the pathway's input, in place of ``s``. Neither
-    carries a gradient (the gating is not differentiated; a spike's gradient is scaled
-    by its ``f``).
+        x <- 1 - (1 - x) d_D,   u <- U + (u - U) d_F,   f = u x / U,
+        x <- x - s u x,         u <- u + s U (1 - u).
+
+    Saturation: the receptors' gating decays, then a release (``f``, 1 without STP)
+    opens the fraction ``c f`` of those still closed — all of them, at most,
+
+        g <- g d,   f <- min(c f (1 - g), 1 - g),   g <- min(g + s f, 1).
+
+    Nothing here carries a gradient (the state is not differentiated; a spike's
+    gradient is scaled by its ``f``).
     """
-    u = u * gate.decay
-    f = gate.saturation * (1 - u)
-    return f, torch.clamp(u + s.detach() * f, max=1.0)
+    c, d, U, d_D, d_F = gate.params.unbind()
+    n = gate.n
+    s = s.detach()
+    f, parts = None, []
+    if gate.stp:
+        u, x = state[:, :n], state[:, n : 2 * n]
+        x = 1 - (1 - x) * d_D
+        u = U + (u - U) * d_F
+        r = u * x
+        f = r / U
+        x = x - s * r
+        u = u + s * U * (1 - u)
+        parts += [u, x]
+    if gate.saturates:
+        g = state[:, -n:] * d
+        closed = 1 - g
+        f = c * closed if f is None else torch.minimum(c * f * closed, closed)
+        parts.append(torch.clamp(g + s * f, max=1.0))
+    return f, torch.cat(parts, dim=1)
 
 
 def gate_feedforward(drive: Drive, x: torch.Tensor, gating: torch.Tensor | None):
-    """The factors ``f`` ``(B, T, n_rows)`` of the saturating feedforward pathways
-    (None for the others) over the chunk ``x``, and the gating state after it.
+    """The factors ``f`` ``(B, T, n_rows)`` of the feedforward pathways with
+    presynaptic dynamics (None for the others) over the chunk ``x``, and the gating
+    state after it.
 
     A step at a time: the reference, and the CPU path.
     """
@@ -190,13 +241,45 @@ def gate_feedforward(drive: Drive, x: torch.Tensor, gating: torch.Tensor | None)
         if gate is None:
             factors.append(None)
             continue
-        u, fs = gating[:, gate.columns], []
+        state, fs = gating[:, gate.columns], []
         for t in range(x.shape[1]):
-            f, u = gate_step(u, x[:, t, rows], gate)
+            f, state = gate_step(state, x[:, t, rows], gate)
             fs.append(f)
-        gating[:, gate.columns] = u
+        gating[:, gate.columns] = state
         factors.append(torch.stack(fs, dim=1))
     return factors, gating
+
+
+def recurrent_gates(drive: Drive, gating: torch.Tensor | None):
+    """Per recurrent pathway, its ``Gate`` and its columns of ``gating`` (None if it
+    has no presynaptic dynamics): the state ``recurrent_activations`` steps."""
+    gates = [drive.gate(k) for k in range(len(drive.recurrent))]
+    return gates, [None if g is None else gating[:, g.columns] for g in gates]
+
+
+def recurrent_activations(drive: Drive, s, gates, state) -> list[torch.Tensor]:
+    """Each recurrent pathway's activation from the spikes ``s`` ``(B, N)``: its rows'
+    spikes, scaled by their factors if it has presynaptic dynamics (``state`` is
+    stepped in place), times its weights."""
+    activations = []
+    for k, (rows, W) in enumerate(drive.recurrent):
+        pre = s[:, rows]
+        if gates[k] is not None:
+            f, state[k] = gate_step(state[k], pre, gates[k])
+            pre = pre * f
+        activations.append(pre @ W)
+    return activations
+
+
+def updated_gating(gating, gates, state):
+    """``gating`` with the recurrent pathways' columns set to ``state``."""
+    if gating is None or not any(g is not None for g in gates):
+        return gating
+    gating = gating.clone()
+    for gate, value in zip(gates, state):
+        if gate is not None:
+            gating[:, gate.columns] = value
+    return gating
 
 
 def stack_steps(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -527,12 +610,21 @@ class ProjectionNetwork(nn.Module):
         return any(hasattr(self, f"_learnt_{name}") for name in names)
 
     def _pathways(self) -> list[Pathway]:
-        """One pathway per source cell type with synapses and projections, per side,
-        and one more per saturating synapse type it makes (sharing its rows)."""
+        """One pathway per source cell type with synapses and projections, per side;
+        more if it makes saturating synapse types or has short-term plasticity: one per
+        (saturating type or the others) x (target cell types sharing one STP), all
+        sharing its rows."""
         saturating = self._saturation() > 0
         pathways, made = [], []
         for side_index, side in enumerate(self._sides):
             names = {c["cell_id"]: c["name"] for c in side.cell_params}
+            stp = {key: as_stp(value) for key, value in (side.stp or {}).items()}
+            unknown = set(stp) - set(side.projections)
+            if unknown:
+                raise ValueError(
+                    f"{side.attribute}: short-term plasticity for {sorted(unknown)}, "
+                    "which have no projection"
+                )
             modes = {}
             for (src, _), projection in side.projections.items():
                 previous = modes.setdefault(src, projection.caching_mode)
@@ -557,13 +649,28 @@ class ProjectionNetwork(nn.Module):
                     one = torch.zeros_like(synapses)
                     one[gate] = True
                     parts.append((gate, one))
-                for gate, mask in parts:
-                    pathways.append(
-                        Pathway(
-                            len(pathways), side_index, cell_type, mode, source, gate
-                        )
-                    )
-                    made.append(mask)
+                groups = {}  # STP (or None) -> the target cell types it reaches
+                for target, target_name in sorted(self._names.items()):
+                    pair = (names[cell_type], target_name)
+                    groups.setdefault(stp.get(pair), []).append(target)
+                for plasticity, targets in groups.items():
+                    targets = None if len(groups) == 1 else tuple(targets)
+                    for gate, mask in parts:
+                        pathway = Pathway(
+                            len(pathways), side_index, cell_type, mode, source, gate,
+                            plasticity, targets,
+                        )  # fmt: skip
+                        pathways.append(pathway)
+                        made.append(mask)
+                        if targets is not None:
+                            reached = np.isin(
+                                np.asarray(self.cell_type_indices), targets
+                            ).astype(np.float32)
+                            self.register_buffer(
+                                f"_targets_{pathway.index}",
+                                torch.from_numpy(reached),
+                                persistent=False,
+                            )
         self.register_buffer(
             "_made",
             torch.stack(made)
@@ -573,15 +680,24 @@ class ProjectionNetwork(nn.Module):
         )
         # Recurrent pathways first: the order the dynamics inject them in.
         pathways = sorted(pathways, key=lambda p: not self._sides[p.side].recurrent)
-        # The gating state's columns: each saturating pathway's source rows, in order.
-        columns, start = {}, 0
+        # The gating state's columns: each presynaptic pathway's (see ``Gate``), in
+        # order, and their values at rest (u = U, x = 1, g = 0).
+        columns, rest = {}, []
         for p in pathways:
-            if p.gate is not None:
-                n_rows = getattr(self, f"_rows_{p.source}").numel()
-                columns[p.index] = (start, start + n_rows)
-                start += n_rows
+            if p.presynaptic:
+                n = getattr(self, f"_rows_{p.source}").numel()
+                columns[p.index] = (sum(map(len, rest)), n)
+                if p.stp is not None:
+                    rest += [np.full(n, p.stp.U), np.ones(n)]
+                if p.gate is not None:
+                    rest.append(np.zeros(n))
         self._gate_columns = columns
-        self.n_gating = start
+        self.register_buffer(
+            "_gating_rest",
+            torch.from_numpy(np.concatenate(rest or [np.zeros(0)]).astype(np.float32)),
+            persistent=False,
+        )
+        self.n_gating = self._gating_rest.numel()
         return pathways
 
     def _assemble(self, pathway: Pathway, connectome: bool = False) -> torch.Tensor:
@@ -625,6 +741,7 @@ class ProjectionNetwork(nn.Module):
         assert dt > 0, "Timestep dt must be positive"
         self.register_buffer("dt", torch.tensor(dt, device=self.device))
         self._set_timestep()
+        self._set_gates()
         self._cache_weights()
         self.reset_state()
 
@@ -688,6 +805,8 @@ class ProjectionNetwork(nn.Module):
                 )
             else:
                 scales.append(ones)
+            if pathway.targets is not None:  # it reaches only these target types
+                scales[-1] = scales[-1] * getattr(self, f"_targets_{pathway.index}")
             rows = getattr(self, f"_rows_{pathway.source}")
             (recurrent if self._sides[pathway.side].recurrent else feedforward).append(
                 (rows, W)
@@ -706,15 +825,34 @@ class ProjectionNetwork(nn.Module):
             gates=gates if self.n_gating else [],
         )
 
+    def _set_gates(self) -> None:
+        """Each presynaptic pathway's ``Gate.params`` at this time step, on the device
+        (so a forward call copies nothing from the host): the saturating type's
+        saturation and the decay of its gating, ``exp(-dt / tau_decay)`` (fixed: see
+        ``_gate_decay``), and the STP's ``U`` and decays."""
+        dt = self.dt.item()
+        for p in self.pathways:
+            if not p.presynaptic:
+                continue
+            zero = torch.zeros((), device=self.device)
+            c, d = (
+                (self.saturation[p.gate], self._gate_decay[p.gate])
+                if p.gate is not None
+                else (zero, zero)
+            )
+            U, d_D, d_F = (p.stp.U, *p.stp.decays(dt)) if p.stp else (1.0, 0.0, 0.0)
+            stp = torch.tensor([U, d_D, d_F], device=self.device)
+            params = torch.cat([torch.stack([c, d]).float(), stp])
+            self.register_buffer(f"_gate_{p.index}", params, persistent=False)
+
     def _gate(self, pathway: Pathway) -> Gate | None:
-        """A saturating pathway's ``Gate``: its type's saturation and the per-step
-        decay of its gating variables, ``exp(-dt / tau_decay)`` (fixed: see
-        ``_gate_decay``)."""
-        if pathway.gate is None:
+        """A presynaptic pathway's ``Gate``, else None."""
+        if not pathway.presynaptic:
             return None
         return Gate(
-            self.saturation[pathway.gate],
-            self._gate_decay[pathway.gate],
+            getattr(self, f"_gate_{pathway.index}"),
+            pathway.stp is not None,
+            pathway.gate is not None,
             *self._gate_columns[pathway.index],
         )
 
@@ -792,12 +930,13 @@ class ProjectionNetwork(nn.Module):
                 (self.batch_size, self.n_neurons), dtype=torch.int32, device=self.device
             )
             self.register_buffer("refractory", counter, persistent=False)
-        gating = torch.zeros((self.batch_size, self.n_gating), device=self.device)
+        gating = self._gating_rest.expand(self.batch_size, -1).clone()
         self.register_buffer("gating", gating, persistent=False)
 
     def get_checkpoint_state(self) -> dict[str, np.ndarray]:
         """The state; the refractory counters only if a neuron has a refractory period
-        (they are zero otherwise), the gating state only if a synapse type saturates."""
+        (they are zero otherwise), the gating state only if a pathway has presynaptic
+        dynamics."""
         state = {
             "v": self.v.cpu().numpy(),
             self.state_name: self._synaptic.cpu().numpy(),
@@ -820,7 +959,7 @@ class ProjectionNetwork(nn.Module):
         self.gating = (
             torch.from_numpy(state["gating"]).to(self.device)
             if "gating" in state
-            else torch.zeros((self.v.shape[0], self.n_gating), device=self.device)
+            else self._gating_rest.expand(self.v.shape[0], -1).clone()
         )
 
     def get_tracked_gradients(self) -> dict[str, torch.Tensor]:

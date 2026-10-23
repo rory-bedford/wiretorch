@@ -9,6 +9,7 @@ The most used names are here; everything else is importable from its subpackage:
 
 - ``network_simulators``: the networks (``conductance``, ``current``, ``rate``
   families; ``projections``; ``two_layer``).
+- ``stp``: short-term plasticity (``STP``, ``DEPRESSING``, ``FACILITATING``).
 - ``synthetic_connectome``: generators of synthetic connectomes.
 - ``snn_runners``: training (``SNNTrainer``), inference (``SNNInference``) and
   evolutionary search.
@@ -39,6 +40,8 @@ _NAMES = {
     "LowRankProjection": "network_simulators.projections",
     "make_frozen_projections": "network_simulators.projections",
     "make_scaling_factor_projections": "network_simulators.projections",
+    # Short-term plasticity
+    "STP": "network_simulators.stp",
     # Running
     "SNNTrainer": "snn_runners",
     "SNNInference": "snn_runners",
@@ -64,7 +67,10 @@ _SUBPACKAGES = (
     "visualization",
 )
 
-__all__ = [*_NAMES, *_SUBPACKAGES]
+#: Short names of modules.
+_MODULES = {"stp": "network_simulators.stp"}
+
+__all__ = [*_NAMES, *_SUBPACKAGES, *_MODULES]
 
 
 def __getattr__(name: str):
@@ -72,6 +78,8 @@ def __getattr__(name: str):
         value = getattr(importlib.import_module(f"{__name__}.{_NAMES[name]}"), name)
     elif name in _SUBPACKAGES:
         value = importlib.import_module(f"{__name__}.{name}")
+    elif name in _MODULES:
+        value = importlib.import_module(f"{__name__}.{_MODULES[name]}")
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value  # load once

@@ -45,6 +45,7 @@ class FeedforwardCurrentLIFNetwork(CurrentNetwork):
         storage_dtype: torch.dtype | str = torch.float32,
         return_probabilities: bool = False,
         learn: dict | None = None,
+        stp: dict | None = None,
     ):
         """
         Args:
@@ -61,6 +62,9 @@ class FeedforwardCurrentLIFNetwork(CurrentNetwork):
                 probability ``sigmoid(surrgrad_scale * (v - theta))``, which carries a
                 true gradient (rate losses can filter it instead of sampled spikes).
             learn: Physiology to train (see ``CurrentNetwork``).
+            stp: Short-term plasticity per ``(input, output)`` cell type pair:
+                ``STP``s (e.g. ``stp.DEPRESSING``) or dicts of ``U``, ``tau_D``,
+                ``tau_F``; pairs not named have none (see ``wiretorch.stp``).
         """
         self.cell_params_FF = cell_params_FF
         self.synapse_params_FF = synapse_params_FF
@@ -76,6 +80,7 @@ class FeedforwardCurrentLIFNetwork(CurrentNetwork):
                 InputSide(
                     projections, cell_params_FF, synapse_params_FF, cell_type_indices_FF,
                     recurrent=False, attribute="projections", mask_buffer="weights_mask_FF",
+                    stp=stp,
                 )
             ],
             unify_synapses=False,

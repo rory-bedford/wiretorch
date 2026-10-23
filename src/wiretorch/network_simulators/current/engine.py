@@ -35,11 +35,17 @@ import torch
 from wiretorch.network_simulators.current import dynamics
 from wiretorch.network_simulators.current.dynamics import Physiology
 from wiretorch.network_simulators.engine import (  # noqa: F401 - re-exported
+    Gating,
     activations,
+    carry_to_sources,
+    gate_feedforward,
+    gating_tables,
     held_buffer,
+    offsets_tensor,
     pad,
     presynaptic as _presynaptic,
     presynaptic_blocks,
+    recurrent_weights,
     refractory_tables,
     row_start,
     triton,
@@ -59,20 +65,20 @@ FF_TIME_BLOCK = 256  # steps of feedforward input materialised at once (no gradi
 
 
 def simulate(
-    v, I, x, drive: Drive, p: Physiology, *, refractory=None, probabilities=False,
-    track=False, track_batch_idx=None, retain=None,
+    v, I, x, drive: Drive, p: Physiology, *, refractory=None, gating=None,
+    probabilities=False, track=False, track_batch_idx=None, retain=None,
 ) -> Run:  # fmt: skip
     """Simulate ``x.shape[1]`` steps; see ``dynamics.simulate`` for the arguments."""
     if refractory is None:
         refractory = torch.zeros(v.shape, dtype=torch.int32, device=v.device)
     if not uses_kernels(x, retain):
         return dynamics.simulate(
-            v, I, x, drive, p, refractory=refractory,
+            v, I, x, drive, p, refractory=refractory, gating=gating,
             probabilities=probabilities, track=track,
             track_batch_idx=track_batch_idx, retain=retain,
         )  # fmt: skip
     return _simulate_kernels(
-        v, I, x, drive, p, refractory, probabilities, track, track_batch_idx
+        v, I, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
     )
 
 
@@ -110,6 +116,8 @@ class _Launch:
     #: of it left, ``(B, N)`` int32 (updated in place): dummies if no neuron has one.
     n_ref: torch.Tensor | None = None
     counter: torch.Tensor | None = None
+    #: The recurrent pathways' presynaptic dynamics (short-term plasticity).
+    gating: Gating | None = None
 
     @property
     def K(self) -> int:
@@ -165,7 +173,7 @@ def _reduce(partials, wants) -> list[torch.Tensor | None]:
 
 
 def _prepare(
-    v, x, drive, p, refractory, probabilities, track, track_batch_idx
+    v, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
 ) -> _Launch:
     B, T = x.shape[:2]
     N = v.shape[1]
@@ -195,7 +203,7 @@ def _prepare(
         tracked=tracked, dummy=dummy,
         wants=tuple(getattr(p, name).requires_grad for name in PHYSIOLOGY),
         recurrent_gradients=drive.recurrent_gradients,
-        n_ref=n_ref, counter=counter,
+        n_ref=n_ref, counter=counter, gating=gating_tables(drive, gating, dummy),
     )  # fmt: skip
 
 
@@ -224,20 +232,25 @@ def _scan(L, A, scale, v, I, spikes, prob, saved, t0=0):
     )  # fmt: skip
 
 
-def _recurrent(L, A_ff_blocks, W, rows, sizes, scale, v, I, spikes, saved):
-    """Per step: ``compact_spikes`` then ``recurrent_step``; updates v, I and the
-    refractory counters in place.
+def _recurrent(L, A_ff_blocks, W, w_offsets, rows, sizes, scale, v, I, spikes, saved):
+    """Per step: ``compact_spikes`` then ``recurrent_step``; updates v, I, the
+    refractory counters and the gating in place.
 
     ``A_ff_blocks`` yields ``(t0, A_ff)`` blocks of feedforward activations in order;
     ``rows`` holds the recurrent pathways' source neurons back to back, ``sizes`` how
-    many each has. ``saved`` is ``(v_saved, A_saved, held)``, or None.
+    many each has, and their weight rows begin at ``w_offsets`` of ``W``. ``saved`` is
+    ``(v_saved, A_saved, held, f_saved)``, or None.
     """
     starts = row_start(sizes, v.device)
-    v_saved, A_saved, held = saved if saved else (L.dummy,) * 3
+    w_start = offsets_tensor(w_offsets, v.device)
+    v_saved, A_saved, held, f_saved = saved if saved else (L.dummy,) * 4
+    gates = L.gating
     W = W.to(L.p.storage_dtype)  # a copy if reduced: gradients stay float32
     capacity = max(sizes)
     lists = torch.empty((L.K_rec, L.B, capacity), dtype=torch.int32, device=v.device)
     counts = torch.zeros((L.K_rec, L.B), dtype=torch.int32, device=v.device)
+    amps = torch.empty(lists.shape, device=v.device) if gates.gated else L.dummy
+    R = gates.state.shape[1] if gates.gated else 0
     surr = L.p.surr_scale
     for t0, A_ff in A_ff_blocks:
         T_ff = A_ff.shape[2]
@@ -245,19 +258,20 @@ def _recurrent(L, A_ff_blocks, W, rows, sizes, scale, v, I, spikes, saved):
             t = t0 + i
             kernels.compact_spikes[(L.B, L.K_rec)](
                 v, L.p.theta, L.noise, L.counter, rows, starts, lists, counts,
-                *(L.dummy,) * 6, surr, t, L.B, L.T, L.N, capacity, 0, 0,
+                gates.params, gates.cols, gates.state, amps, f_saved,
+                surr, t, L.B, L.T, L.N, capacity, R, gates.R_f,
                 BLOCK=COMPACT_BLOCK, SAMPLE=L.sample, REFRACTORY=L.refractory,
-                GATED=False, SAVE=False,
+                GATED=gates.gated, SAVE=bool(saved),
             )  # fmt: skip
             kernels.recurrent_step[(L.B, triton.cdiv(L.N, STEP_BLOCK))](
-                A_ff, W, starts[:-1], lists, counts, scale, L.made, L.sign, L.decay,
+                A_ff, W, w_start, lists, amps, counts, scale, L.made, L.sign, L.decay,
                 *_neurons(L.p), v, I, spikes, L.noise, L.n_ref, L.counter,
                 v_saved, A_saved, held, *_track_buffers(L),
                 surr, L.track_b, t, i, L.T, T_ff, L.B, L.N, capacity,
                 K_REC=L.K_rec, K_FF=L.K_ff, S=L.S, SP=L.SP,
                 BLOCK=STEP_BLOCK, ROWS=GATHER_ROWS,
                 SAVE=bool(saved), TRACK=L.tracked is not None, SAMPLE=L.sample,
-                REFRACTORY=L.refractory,
+                REFRACTORY=L.refractory, GATED=gates.gated,
             )  # fmt: skip
 
 
@@ -284,11 +298,14 @@ def _scan_backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scal
     )
 
 
-def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_scale):
+def _recurrent_backward(
+    L, saved, A, scale, W, w_offsets, rows, sizes, factors, grad_spikes, want_scale
+):
     """The reverse loop over steps: returns ``(grad_A, grad_scale, *physiology)``.
 
     ``grad_A`` ``(K, B, T, N)`` is always computed: its recurrent part is what reaches
-    the presynaptic spikes. ``grad_scale`` and the physiology are None unless wanted.
+    the presynaptic spikes (a presynaptic pathway's times its ``factors``).
+    ``grad_scale`` and the physiology are None unless wanted.
     ``saved`` is ``(spikes, v_saved, v_final, I_init, held)``.
     """
     spikes, v_saved, v_final, I_init, held = saved
@@ -303,7 +320,8 @@ def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_sc
     H = torch.zeros_like(lI) if L.wants[5] else L.dummy
     flags = L.flags()
     want_theta = flags.pop("WANT_THETA")
-    blocks = presynaptic_blocks(W, rows, sizes, L.p.storage_dtype)
+    blocks = presynaptic_blocks(W, rows, sizes, L.p.storage_dtype, w_offsets)
+    shared = len(set(w_offsets)) < len(w_offsets)  # sources in more than one pathway
     grad_spikes = grad_spikes.contiguous()
     for t in reversed(range(L.T)):
         kernels.inject_backward[grid](
@@ -313,8 +331,7 @@ def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_sc
             K=L.K, S=L.S, SP=L.SP, BLOCK=BLOCK, WANT_SCALE=want_scale, **flags,
             REFRACTORY=L.refractory,
         )  # fmt: skip
-        for k, (source, carry) in enumerate(blocks):
-            R.index_copy_(1, source, carry(grad_A[k, :, t]))
+        carry_to_sources(R, blocks, grad_A[:, :, t], factors, t, shared)
         kernels.spike_backward[grid](
             lv, v_saved, held, grad_spikes, R, L.p.theta, g_theta, L.p.surr_scale,
             t, L.B, L.T, L.N, BLOCK=BLOCK, SAMPLE=L.sample, WANT_THETA=want_theta,
@@ -368,27 +385,33 @@ class _RecurrentRun(torch.autograd.Function):
     the physiology (``PHYSIOLOGY``, which the kernels read from ``L.p``)."""
 
     @staticmethod
-    def forward(ctx, A_ff, scale, W, v, I, L: _Launch, rows, sizes, *physiology):
+    def forward(
+        ctx, A_ff, scale, W, v, I, L: _Launch, w_offsets, rows, sizes, *physiology
+    ):
         spikes = torch.empty((L.B, L.T, L.N), device=A_ff.device)
         v_saved = torch.empty_like(spikes)
         A_rec = torch.empty((L.K_rec, L.B, L.T, L.N), device=A_ff.device)
         held = L.held()
+        f_saved = L.gating.f_saved(L.B, L.T, L.dummy)
         I_init = L.ends(v, I)[1]
         _recurrent(
-            L, [(0, A_ff)], W, rows, sizes, scale, v, I, spikes,
-            (v_saved, A_rec, held),
+            L, [(0, A_ff)], W, w_offsets, rows, sizes, scale, v, I, spikes,
+            (v_saved, A_rec, held, f_saved),
         )  # fmt: skip
-        ctx.L, ctx.rows, ctx.sizes = L, rows, sizes
+        ctx.L, ctx.w_offsets, ctx.rows, ctx.sizes = L, w_offsets, rows, sizes
+        ctx.n_weights = W.shape[0]
         ctx.save_for_backward(
-            A_ff, scale, W, spikes, v_saved, L.ends(v, I)[0], I_init, held, A_rec
-        )
+            A_ff, scale, W, spikes, v_saved, L.ends(v, I)[0], I_init, held, A_rec,
+            f_saved,
+        )  # fmt: skip
         ctx.mark_non_differentiable(v, I)
         return spikes, v, I
 
     @staticmethod
     def backward(ctx, grad_spikes, _v, _I):
-        A_ff, scale, W, *saved, A_rec = ctx.saved_tensors
-        L, rows, sizes = ctx.L, ctx.rows, ctx.sizes
+        A_ff, scale, W, *saved, A_rec, f_saved = ctx.saved_tensors
+        L, w_offsets, rows, sizes = ctx.L, ctx.w_offsets, ctx.rows, ctx.sizes
+        factors = L.gating.factors(f_saved, sizes)
         want_ff, want_scale, want_W = ctx.needs_input_grad[:3]
         spikes = saved[0]
         if grad_spikes is None:
@@ -396,16 +419,26 @@ class _RecurrentRun(torch.autograd.Function):
         A = (torch.cat([A_rec, A_ff]) if L.K_ff else A_rec).contiguous()
         if L.recurrent_gradients:
             grad_A, grad_scale, *physiology = _recurrent_backward(
-                L, saved, A, scale, W, rows, sizes, grad_spikes, want_scale
-            )
+                L, saved, A, scale, W, w_offsets, rows, sizes, factors, grad_spikes,
+                want_scale,
+            )  # fmt: skip
         else:  # the recurrent activations are input like any other: one reverse scan
             grad_A, grad_scale, *physiology = _scan_backward(
                 L, saved, A, scale, grad_spikes, None,
                 want_A=want_ff or want_W, want_scale=want_scale,
             )  # fmt: skip
-        grad_W = weight_gradient(spikes, rows, sizes, grad_A) if want_W else None
+        grad_W = (
+            weight_gradient(
+                spikes, rows, sizes, grad_A, w_offsets, ctx.n_weights, factors
+            )
+            if want_W
+            else None
+        )
         grad_ff = grad_A[L.K_rec :] if want_ff else None
-        return grad_ff, grad_scale, grad_W, None, None, None, None, None, *physiology
+        return (
+            grad_ff, grad_scale, grad_W, None, None, None, None, None, None,
+            *physiology,
+        )  # fmt: skip
 
 
 # =====================================================================
@@ -414,9 +447,13 @@ class _RecurrentRun(torch.autograd.Function):
 
 
 def _simulate_kernels(
-    v, I, x, drive, p, refractory, probabilities, track, track_batch_idx
+    v, I, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
 ) -> Run:
-    L = _prepare(v, x, drive, p, refractory, probabilities, track, track_batch_idx)
+    if gating is not None:  # updated in place by the kernels
+        gating = gating.detach().float().contiguous().clone()
+    L = _prepare(
+        v, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
+    )
     counter = L.counter if L.refractory else refractory
     v = v.detach().float().contiguous().clone()
     # Currents are stored (B, S, N), so each synapse type is contiguous over neurons,
@@ -434,35 +471,47 @@ def _simulate_kernels(
         or any(L.wants)
     )
 
+    def inputs(x):
+        """The feedforward activations of ``x``, the next steps of the chunk (the
+        feedforward gating is stepped through them)."""
+        factors, _ = gate_feedforward(drive, x, gating)
+        return activations(drive, x, factors).contiguous()
+
+    def run(spikes, prob=None):
+        state = I.permute(0, 2, 1).float()
+        return Run(spikes, v, state, prob, L.tracked, counter, gating)
+
     if L.K_rec == 0:
         if grad:
-            A = activations(drive, x).contiguous()
+            A = inputs(x)
             spikes, prob, v, I = _FeedforwardScan.apply(A, scale, v, I, L, *physiology)
         else:
             spikes = torch.empty((L.B, L.T, L.N), device=x.device)
             prob = torch.empty_like(spikes) if probabilities else None
             with torch.no_grad():
                 for t0 in range(0, L.T, FF_TIME_BLOCK):
-                    A = activations(drive, x[:, t0 : t0 + FF_TIME_BLOCK])
-                    _scan(L, A.contiguous(), scale, v, I, spikes, prob, None, t0=t0)
-        return Run(spikes, v, I.permute(0, 2, 1).float(), prob, L.tracked, counter)
+                    A = inputs(x[:, t0 : t0 + FF_TIME_BLOCK])
+                    _scan(L, A, scale, v, I, spikes, prob, None, t0=t0)
+        return run(spikes, prob)
 
     rows = torch.cat([r for r, _ in drive.recurrent]).int().contiguous()
     sizes = tuple(r.numel() for r, _ in drive.recurrent)
-    W = torch.cat([W for _, W in drive.recurrent]).float().contiguous()
+    W, w_offsets = recurrent_weights(drive.recurrent)
 
     if grad:
-        A_ff = activations(drive, x).contiguous()
+        A_ff = inputs(x)
         spikes, v, I = _RecurrentRun.apply(
-            A_ff, scale, W, v, I, L, rows, sizes, *physiology
+            A_ff, scale, W, v, I, L, w_offsets, rows, sizes, *physiology
         )
     else:
         spikes = torch.empty((L.B, L.T, L.N), device=x.device)
 
         def blocks():
             for t0 in range(0, L.T, FF_TIME_BLOCK):
-                yield t0, activations(drive, x[:, t0 : t0 + FF_TIME_BLOCK]).contiguous()
+                yield t0, inputs(x[:, t0 : t0 + FF_TIME_BLOCK])
 
         with torch.no_grad():
-            _recurrent(L, blocks(), W, rows, sizes, scale, v, I, spikes, None)
-    return Run(spikes, v, I.permute(0, 2, 1).float(), None, L.tracked, counter)
+            _recurrent(
+                L, blocks(), W, w_offsets, rows, sizes, scale, v, I, spikes, None
+            )
+    return run(spikes)

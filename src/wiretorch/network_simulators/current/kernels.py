@@ -330,18 +330,20 @@ def scan_backward(
 
 @triton.jit
 def recurrent_step(
-    A_ff, W, w_start, lists, counts, scale, made, sign, decay, theta, U_reset, beta,
+    A_ff, W, w_start, lists, amps, counts, scale, made, sign, decay, theta, U_reset, beta,
     U_rest, R, v_state, I_state, spikes, noise, n_ref, counter, v_saved, A_saved,
     held_saved, track_v, track_I, surr_ptr, track_b, t, t_ff, T, T_ff, B, N, L,
     K_REC: tl.constexpr, K_FF: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, ROWS: tl.constexpr, SAVE: tl.constexpr, TRACK: tl.constexpr,
-    SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
+    SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr, GATED: tl.constexpr,
 ):  # fmt: skip
     """Advance a recurrent network one step, for one trial and a block of neurons.
 
     Recurrent activations are gathered from the weight rows listed by
-    ``compact_spikes``; feedforward ones are read from ``A_ff`` at ``t_ff``. The
-    refractory period as in ``scan_forward``.
+    ``compact_spikes`` (pathway ``k``'s from row ``w_start[k]`` of ``W``; pathways of
+    one source cell type share its rows), with ``GATED`` each times its factor in
+    ``amps`` (short-term plasticity); feedforward ones are read from ``A_ff`` at
+    ``t_ff``. The refractory period as in ``scan_forward``.
     """
     surr_scale = tl.load(surr_ptr)
     b = tl.program_id(0)
@@ -388,8 +390,13 @@ def recurrent_step(
                     W + row[:, None] * N + n[None, :],
                     mask=(m_ < fired)[:, None] & live[None, :],
                     other=0.0,
-                )
-                a += tl.sum(w.to(tl.float32), axis=0)
+                ).to(tl.float32)
+                if GATED:
+                    amp = tl.load(
+                        amps + (k * B + b) * L + m_, mask=m_ < fired, other=0.0
+                    )
+                    w = w * amp[:, None]
+                a += tl.sum(w, axis=0)
             if SAVE:
                 tl.store(A_saved + k * (B * T * N) + out, a, mask=live)
         else:

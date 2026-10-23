@@ -61,6 +61,8 @@ class CurrentLIFNetwork(CurrentNetwork):
         storage_dtype: torch.dtype | str = torch.float32,
         learn: dict | None = None,
         recurrent_gradients: bool = True,
+        rec_stp: dict | None = None,
+        ff_stp: dict | None = None,
     ):
         """
         Args:
@@ -94,6 +96,9 @@ class CurrentLIFNetwork(CurrentNetwork):
                 the voltages and synaptic currents; if not, each step's recurrent input
                 is treated as given. Default True; False makes the backward pass one
                 reverse scan instead of a loop over steps.
+            rec_stp, ff_stp: Short-term plasticity per ``(source, target)`` cell type
+                pair of each side: ``STP``s (e.g. ``stp.DEPRESSING``) or dicts of
+                ``U``, ``tau_D``, ``tau_F``; pairs not named have none (see ``stp``).
         """
         self.synapse_params = synapse_params
         self.cell_params_FF = cell_params_FF
@@ -110,10 +115,12 @@ class CurrentLIFNetwork(CurrentNetwork):
                 InputSide(
                     rec_projections, cell_params, synapse_params, cell_type_indices,
                     recurrent=True, attribute="rec_projections", mask_buffer="weights_mask",
+                    stp=rec_stp,
                 ),
                 InputSide(
                     ff_projections, cell_params_FF, synapse_params_FF, cell_type_indices_FF,
                     recurrent=False, attribute="ff_projections", mask_buffer="weights_mask_FF",
+                    stp=ff_stp,
                 ),
             ],
             unify_synapses=True,
@@ -154,6 +161,8 @@ class CurrentLIFNetwork(CurrentNetwork):
         learn: dict | None = None,
         cell_params_FF: list[dict] | None = None,
         recurrent_gradients: bool = True,
+        rec_stp: dict | None = None,
+        ff_stp: dict | None = None,
     ) -> CurrentLIFNetwork:
         """The network as the former weight-matrix constructor described it.
 
@@ -172,6 +181,7 @@ class CurrentLIFNetwork(CurrentNetwork):
             cell_params_FF: Names of the input cell types (default ``input_<id>``).
             recurrent_gradients: Whether gradients flow through the recurrent spikes
                 (see the constructor).
+            rec_stp, ff_stp: Short-term plasticity (see the constructor).
             The rest: as the constructor. The neurons are in natural units (threshold 1,
             reset 0) whatever ``cell_params`` says, as before, and the weights are
             rescaled for the normalised step (``legacy.former_factors``), so this is
@@ -217,6 +227,8 @@ class CurrentLIFNetwork(CurrentNetwork):
             track_batch_idx=track_batch_idx,
             learn=learn,
             recurrent_gradients=recurrent_gradients,
+            rec_stp=rec_stp,
+            ff_stp=ff_stp,
         )
         model.optimisable = optimisable
         return model

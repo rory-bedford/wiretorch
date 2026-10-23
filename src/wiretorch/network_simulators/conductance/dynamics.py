@@ -16,10 +16,10 @@ follow line for line. One step, for every neuron of every trial:
    period), and a counter per neuron (``refractory``, part of the state) tracks them.
 4. **Decay** each conductance component, then **inject** this step's input: every
    pathway adds its activation (presynaptic spikes times weights) times its kernel.
-   A saturating synapse type's pathway scales each spike by the fraction of its
-   source's closed receptors that it opens, from the source's gating variable
-   (``network.gate_step``, part of the state ``gating``), so that its conductance
-   follows ``g_bar sum_j w_j u_j`` (exactly, as ``tau_rise -> 0``).
+   A pathway with presynaptic dynamics — short-term plasticity, a saturating synapse
+   type — scales each spike by a factor from its source's state (``network.gate_step``,
+   part of the state ``gating``); with saturation the conductance follows
+   ``g_bar sum_j w_j g_j`` (exactly, as ``tau_rise -> 0``).
 
 Gradients flow through the voltage and conductances (backprop through time), into the
 spikes only via the surrogate, and never through the reset. They flow through the
@@ -37,10 +37,12 @@ from wiretorch.network_simulators.network import (  # noqa: F401
     Run,
     count_down,
     gate_feedforward,
-    gate_step,
     held_at_reset,
+    recurrent_activations,
+    recurrent_gates,
     refractory_mask,
     stack_steps,
+    updated_gating,
 )
 from wiretorch.training_utils.surrogate_gradients import (
     SampleSpike,
@@ -161,9 +163,7 @@ def simulate(
     factors, gating = gate_feedforward(drive, x, gating)
     A_ff = drive.feedforward_activations(x, factors)
     kernels = jumps(drive, p.jump)
-    gates = [drive.gate(k) for k in range(len(drive.recurrent))]
-    if any(gates):
-        u = [None if gate is None else gating[:, gate.columns] for gate in gates]
+    gates, state = recurrent_gates(drive, gating)
     keep = (
         slice(None)
         if track_batch_idx is None
@@ -182,13 +182,7 @@ def simulate(
         v_next, I, I_leak = membrane(v, held_at_reset(s, held), g, p)
         refractory = count_down(s, refractory, p.n_ref)
         s_rec = s if drive.recurrent_gradients else s.detach()
-        activations = []
-        for k, (rows, W) in enumerate(drive.recurrent):
-            pre = s_rec[:, rows]
-            if gates[k] is not None:  # each spike times the fraction it opens
-                f, u[k] = gate_step(u[k], pre, gates[k])
-                pre = pre * f
-            activations.append(pre @ W)
+        activations = recurrent_activations(drive, s_rec, gates, state)
         activations += list(A_ff[:, :, t])
         g = g * p.decay
         for a, kernel in zip(activations, kernels):
@@ -215,14 +209,5 @@ def simulate(
         probabilities=torch.stack(probs, dim=1) if probabilities else None,
         tracked={k: stack_steps(val) for k, val in tracked.items()} if track else None,
         refractory=refractory,
-        gating=_gating(gating, gates, u) if any(gates) else gating,
+        gating=updated_gating(gating, gates, state),
     )
-
-
-def _gating(gating, gates, u):
-    """The gating state with the recurrent pathways' columns updated to ``u``."""
-    gating = gating.clone()
-    for gate, value in zip(gates, u):
-        if gate is not None:
-            gating[:, gate.columns] = value
-    return gating

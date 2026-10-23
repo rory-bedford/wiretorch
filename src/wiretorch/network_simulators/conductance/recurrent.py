@@ -62,6 +62,8 @@ class ConductanceLIFNetwork(ConductanceNetwork):
         storage_dtype: torch.dtype | str = torch.float32,
         learn: dict | None = None,
         recurrent_gradients: bool = False,
+        rec_stp: dict | None = None,
+        ff_stp: dict | None = None,
     ):
         """
         Args:
@@ -95,6 +97,9 @@ class ConductanceLIFNetwork(ConductanceNetwork):
                 the voltages and synaptic states; if not, each step's recurrent input
                 is treated as given. Default False, whose backward pass is one reverse
                 scan; True steps back one step at a time.
+            rec_stp, ff_stp: Short-term plasticity per ``(source, target)`` cell type
+                pair of each side: ``STP``s (e.g. ``stp.DEPRESSING``) or dicts of
+                ``U``, ``tau_D``, ``tau_F``; pairs not named have none (see ``stp``).
         """
         self.synapse_params = synapse_params
         self.cell_params_FF = cell_params_FF
@@ -111,10 +116,12 @@ class ConductanceLIFNetwork(ConductanceNetwork):
                 InputSide(
                     rec_projections, cell_params, synapse_params, cell_type_indices,
                     recurrent=True, attribute="rec_projections", mask_buffer="weights_mask",
+                    stp=rec_stp,
                 ),
                 InputSide(
                     ff_projections, cell_params_FF, synapse_params_FF, cell_type_indices_FF,
                     recurrent=False, attribute="ff_projections", mask_buffer="weights_mask_FF",
+                    stp=ff_stp,
                 ),
             ],
             unify_synapses=True,

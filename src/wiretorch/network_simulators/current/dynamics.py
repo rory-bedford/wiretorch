@@ -41,9 +41,13 @@ from wiretorch.network_simulators.network import (
     Drive,
     Run,
     count_down,
+    gate_feedforward,
     held_at_reset,
+    recurrent_activations,
+    recurrent_gates,
     refractory_mask,
     stack_steps,
+    updated_gating,
 )
 from wiretorch.training_utils.surrogate_gradients import (
     SampleSpike,
@@ -109,6 +113,7 @@ def simulate(
     p: Physiology,
     *,
     refractory: torch.Tensor | None = None,
+    gating: torch.Tensor | None = None,
     probabilities: bool = False,
     track: bool = False,
     track_batch_idx: int | None = None,
@@ -119,14 +124,18 @@ def simulate(
     Args:
         v, I: State, ``(B, N)`` and ``(B, N, S)``.
         refractory: Steps of refractory period left, ``(B, N)`` int32 (None: none).
+        gating: The presynaptic pathways' state ``(B, R)`` (short-term plasticity:
+            see ``Drive``), if any.
         x: Feedforward input, ``(B, T, n_inputs)``.
         probabilities: Also return the escape-noise spike probability per step.
         track, track_batch_idx: Record ``Run.tracked``, for one trial or all (None):
             the voltage after each step ``v`` and the currents after the input ``I``.
         retain: If a list, append ``(v, I, s)`` of every step with gradients retained.
     """
-    A_ff = drive.feedforward_activations(x)
+    factors, gating = gate_feedforward(drive, x, gating)
+    A_ff = drive.feedforward_activations(x, factors)
     jumps = kernels(drive)
+    gates, state = recurrent_gates(drive, gating)
     keep = (
         slice(None)
         if track_batch_idx is None
@@ -144,7 +153,7 @@ def simulate(
             probs.append(prob if held is None else prob * (1 - held))
         # Unless detached, the gradient reaches the presynaptic neurons' surrogates.
         s_rec = s if drive.recurrent_gradients else s.detach()
-        activations = [s_rec[:, rows] @ W for rows, W in drive.recurrent]
+        activations = recurrent_activations(drive, s_rec, gates, state)
         activations += list(A_ff[:, :, t])
         I = I * p.decay
         for a, jump in zip(activations, jumps):
@@ -169,4 +178,5 @@ def simulate(
         probabilities=torch.stack(probs, dim=1) if probabilities else None,
         tracked={k: stack_steps(val) for k, val in tracked.items()} if track else None,
         refractory=refractory,
+        gating=updated_gating(gating, gates, state),
     )
