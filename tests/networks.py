@@ -232,12 +232,27 @@ def recurrent(
     n_steps=200,
     input_seed=0,
     learn=None,
+    learnt_weights=False,
 ):
     """``ConductanceLIFNetwork`` with frozen weights or perturbed scaling factors, and
-    the physiology ``learn`` names."""
+    the physiology ``learn`` names; ``learnt_weights`` makes the recurrent weights
+    full-rank parameters (and the feedforward ones scaling factors)."""
     rng, types, w_rec, w_ff = _structure(seed, n, n_ff)
     ff_types = np.zeros(n_ff, dtype=np.int64)
-    if scaling_factors:
+    if learnt_weights:
+        rec = {
+            k: FullRankProjection(b, mask=b != 0)
+            for k, b in per_type_blocks(
+                w_rec, types, types, REC_NAMES, REC_NAMES
+            ).items()
+        }
+        ff = {
+            k: ScalingFactorProjection(b)
+            for k, b in per_type_blocks(
+                w_ff, ff_types, types, ["mitral"], REC_NAMES
+            ).items()
+        }
+    elif scaling_factors:
         rec = {
             k: ScalingFactorProjection(b)
             for k, b in per_type_blocks(

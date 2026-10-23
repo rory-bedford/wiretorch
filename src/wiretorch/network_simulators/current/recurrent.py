@@ -22,8 +22,8 @@ class CurrentLIFNetwork(CurrentNetwork):
     Neurons receive recurrent input from each other through ``rec_projections`` and
     external input through ``ff_projections``, both dicts mapping
     ``(source_cell_type_name, target_cell_type_name)`` to a ``Projection``. See
-    ``current.dynamics`` for the time step: unlike ``ConductanceLIFNetwork``, gradients
-    flow through the recurrent spikes.
+    ``current.dynamics`` for the time step. Gradients flow through the recurrent spikes
+    unless ``recurrent_gradients`` is False (``ConductanceLIFNetwork``'s default).
 
     The state (``v``, ``I_syn``) continues across ``forward`` calls, so a long
     simulation can be run in chunks; call ``reset_state()`` before an independent one.
@@ -57,6 +57,7 @@ class CurrentLIFNetwork(CurrentNetwork):
         track_batch_idx: int | None = None,
         storage_dtype: torch.dtype | str = torch.float32,
         learn: dict | None = None,
+        recurrent_gradients: bool = True,
     ):
         """
         Args:
@@ -83,6 +84,11 @@ class CurrentLIFNetwork(CurrentNetwork):
             learn: Physiology to train, per cell type (``tau_mem``, ``theta``,
                 ``U_reset``, ``U_rest``, ``R``) or synapse type (``tau_syn``): True for
                 every type or a list of names (see ``CurrentNetwork``).
+            recurrent_gradients: Whether gradients flow through the recurrent spikes
+                into the presynaptic neurons (via their surrogates), as well as through
+                the voltages and synaptic currents; if not, each step's recurrent input
+                is treated as given. Default True; False makes the backward pass one
+                reverse scan instead of a loop over steps.
         """
         self.synapse_params = synapse_params
         self.cell_params_FF = cell_params_FF
@@ -116,6 +122,7 @@ class CurrentLIFNetwork(CurrentNetwork):
             learn=learn,
         )  # fmt: skip
         self.register_buffer("cell_type_indices_FF", _long(cell_type_indices_FF))
+        self.recurrent_gradients = recurrent_gradients
 
     @classmethod
     def from_weights(
@@ -141,6 +148,7 @@ class CurrentLIFNetwork(CurrentNetwork):
         use_tqdm: bool = False,
         learn: dict | None = None,
         cell_params_FF: list[dict] | None = None,
+        recurrent_gradients: bool = True,
     ) -> CurrentLIFNetwork:
         """The network as the former weight-matrix constructor described it.
 
@@ -157,6 +165,8 @@ class CurrentLIFNetwork(CurrentNetwork):
             use_tqdm: Ignored (the networks no longer show a progress bar).
             learn: Physiology to train (see the constructor).
             cell_params_FF: Names of the input cell types (default ``input_<id>``).
+            recurrent_gradients: Whether gradients flow through the recurrent spikes
+                (see the constructor).
             The rest: as the constructor. The neurons are in natural units (threshold 1,
             reset 0) whatever ``cell_params`` says, as before, and the weights are
             rescaled for the normalised step (``legacy.former_factors``), so this is
@@ -201,6 +211,7 @@ class CurrentLIFNetwork(CurrentNetwork):
             track_gradients=track_gradients,
             track_batch_idx=track_batch_idx,
             learn=learn,
+            recurrent_gradients=recurrent_gradients,
         )
         model.optimisable = optimisable
         return model

@@ -10,10 +10,11 @@ the kernels of ``kernels.py``:
   ``recurrent_step`` gathers just those weight rows and integrates.
 * With gradients, the forward pass saves the voltage and recurrent activations of
   every step. A feedforward network's backward pass is one reverse-time scan,
-  ``scan_backward``. A recurrent one's is a reverse loop over steps, because gradients
-  flow through the recurrent spikes: ``inject_backward`` gives every pathway's
-  ``dL/da``, a product with ``W^T`` (sparse, for a sparse connectome) carries it to
-  the presynaptic spikes, and
+  ``scan_backward``, and so is a recurrent one's when gradients do not flow through the
+  recurrent spikes (the saved activations are then just more input). When they do
+  (``Drive.recurrent_gradients``, the default here), it is a reverse loop over steps:
+  ``inject_backward`` gives every pathway's ``dL/da``, a product with ``W^T`` (sparse,
+  for a sparse connectome) carries it to the presynaptic spikes, and
   ``spike_backward`` adds it to their voltages' adjoints.
 * Learnt physiology (``theta``, ``U_reset``, ``beta``, ``U_rest``, ``R``, the synaptic
   decays) gets its gradient from the same backward kernels, each term compiled in only
@@ -27,19 +28,21 @@ families share — the dispatch rule, sparse feedforward input — is in
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass, replace
 
 import torch
 
 from wiretorch.network_simulators.current import dynamics
 from wiretorch.network_simulators.current.dynamics import Physiology
-from wiretorch.network_simulators.engine import (
+from wiretorch.network_simulators.engine import (  # noqa: F401 - re-exported
     activations,
     pad,
+    presynaptic as _presynaptic,
+    presynaptic_blocks,
     row_start,
     triton,
     uses_kernels,
+    weight_gradient,
 )
 from wiretorch.network_simulators.network import Drive, Run
 
@@ -51,8 +54,6 @@ STEP_BLOCK = 256  # neurons per program (recurrent step)
 GATHER_ROWS = 16  # weight rows of fired neurons summed per load
 COMPACT_BLOCK = 1024  # neurons per iteration of the spike compaction
 FF_TIME_BLOCK = 256  # steps of feedforward input materialised at once (no gradients)
-#: Carry gradients back through recurrent weights at most this dense by sparse products.
-SPARSE_WEIGHTS = 0.25
 
 
 def simulate(
@@ -97,6 +98,8 @@ class _Launch:
     dummy: torch.Tensor  # stands in for unused pointer arguments
     #: Which physiology gradients are wanted, in ``PHYSIOLOGY`` order.
     wants: tuple[bool, ...] = (False,) * 6
+    #: Whether gradients flow through the recurrent spikes (see ``Drive``).
+    recurrent_gradients: bool = False
 
     @property
     def K(self) -> int:
@@ -170,6 +173,7 @@ def _prepare(v, x, drive, p, probabilities, track, track_batch_idx) -> _Launch:
         track_b=(-1 if track_batch_idx is None else track_batch_idx) if track else 0,
         tracked=tracked, dummy=dummy,
         wants=tuple(getattr(p, name).requires_grad for name in PHYSIOLOGY),
+        recurrent_gradients=drive.recurrent_gradients,
     )  # fmt: skip
 
 
@@ -272,14 +276,7 @@ def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_sc
     H = torch.zeros_like(lI) if L.wants[5] else L.dummy
     flags = L.flags()
     want_theta = flags.pop("WANT_THETA")
-    starts = [0, *itertools.accumulate(sizes)]
-    blocks = [
-        (
-            rows[starts[k] : starts[k + 1]].long(),
-            _presynaptic(W[starts[k] : starts[k + 1]], L.p.storage_dtype),
-        )
-        for k in range(L.K_rec)
-    ]
+    blocks = presynaptic_blocks(W, rows, sizes, L.p.storage_dtype)
     grad_spikes = grad_spikes.contiguous()
     for t in reversed(range(L.T)):
         kernels.inject_backward[grid](
@@ -301,24 +298,6 @@ def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_sc
         partial.sum(dim=1) if want_scale else None,
         *_reduce(physiology, L.wants),
     )
-
-
-def _presynaptic(W_k: torch.Tensor, dtype: torch.dtype = torch.float32):
-    """``g -> g @ W_k.T``: a pathway's ``dL/da`` ``(B, N)`` carried to its sources.
-
-    Connectomes are sparse, so in float32 a sparse ``W_k`` (built once per backward
-    pass) makes this one cuSPARSE product per step instead of a dense
-    ``(B, N) x (N, n_k)`` GEMM. With float16 storage it is a dense GEMM on the tensor
-    cores instead, 2.8x faster than cuSPARSE on the teacher's connectome (relative
-    error ~4e-4, accumulating in float32).
-    """
-    if dtype == torch.float16:
-        W_t = W_k.T.contiguous().half()
-        return lambda g: (g.half() @ W_t).float()
-    if torch.count_nonzero(W_k) > SPARSE_WEIGHTS * W_k.numel():
-        return lambda g: g @ W_k.T
-    W_csr = W_k.to_sparse_csr()
-    return lambda g: (W_csr @ g.T.contiguous()).T
 
 
 # =====================================================================
@@ -382,20 +361,17 @@ class _RecurrentRun(torch.autograd.Function):
         spikes = saved[0]
         if grad_spikes is None:
             grad_spikes = torch.zeros_like(spikes)
-        A = torch.cat([A_rec, A_ff]) if L.K_ff else A_rec
-        grad_A, grad_scale, *physiology = _recurrent_backward(
-            L, saved, A.contiguous(), scale, W, rows, sizes, grad_spikes, want_scale
-        )
-        grad_W = None
-        if want_W:
-            # dL/dW_k = sum over (trial, step) of presynaptic spikes x dL/dA_k.
-            pieces, starts = [], [0, *itertools.accumulate(sizes)]
-            for k in range(L.K_rec):
-                pre = spikes[:, :, rows[starts[k] : starts[k + 1]]]
-                pieces.append(
-                    pre.reshape(-1, pre.shape[-1]).T @ grad_A[k].reshape(-1, L.N)
-                )
-            grad_W = torch.cat(pieces)
+        A = (torch.cat([A_rec, A_ff]) if L.K_ff else A_rec).contiguous()
+        if L.recurrent_gradients:
+            grad_A, grad_scale, *physiology = _recurrent_backward(
+                L, saved, A, scale, W, rows, sizes, grad_spikes, want_scale
+            )
+        else:  # the recurrent activations are input like any other: one reverse scan
+            grad_A, grad_scale, *physiology = _scan_backward(
+                L, saved, A, scale, grad_spikes, None,
+                want_A=want_ff or want_W, want_scale=want_scale,
+            )  # fmt: skip
+        grad_W = weight_gradient(spikes, rows, sizes, grad_A) if want_W else None
         grad_ff = grad_A[L.K_rec :] if want_ff else None
         return grad_ff, grad_scale, grad_W, None, None, None, None, None, *physiology
 

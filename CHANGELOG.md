@@ -2,6 +2,13 @@
 
 The release notes of each version on GitHub are taken from its section here.
 
+## [Unreleased]
+
+- `recurrent_gradients` on `ConductanceLIFNetwork` and `CurrentLIFNetwork`: whether
+  gradients flow through the recurrent spikes into the presynaptic neurons. Both
+  families now support both settings, with Triton kernels for each. The defaults are
+  unchanged: off for conductance-based networks, on for current-based ones.
+
 ## [0.1.0b1] - 2026-10-22
 
 First public beta.

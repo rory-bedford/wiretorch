@@ -93,6 +93,9 @@ class Drive:
     feedforward: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
     #: Input columns that can carry a gradient (None: any); the rest are data.
     differentiable_inputs: slice | None = None
+    #: Whether gradients flow through the recurrent spikes, into the presynaptic
+    #: neurons' surrogates; if not, the recurrent activations are treated as input.
+    recurrent_gradients: bool = False
 
     def feedforward_activations(self, x: torch.Tensor) -> torch.Tensor:
         """``(K_ff, B, T, N)``: each feedforward pathway's input times its weights."""
@@ -155,6 +158,9 @@ class ProjectionNetwork(nn.Module):
     output_name = "s"
     #: The module whose ``simulate`` runs the time steps.
     _engine = None
+    #: Whether gradients flow through the recurrent spikes (see ``Drive``); the
+    #: recurrent networks take it as an argument.
+    recurrent_gradients = False
 
     def __init__(
         self,
@@ -511,6 +517,7 @@ class ProjectionNetwork(nn.Module):
             recurrent=recurrent,
             feedforward=feedforward,
             differentiable_inputs=self.differentiable_inputs,
+            recurrent_gradients=self.recurrent_gradients,
         )
 
     # The time loop runs in the engine (Triton kernels on CUDA): there is nothing for

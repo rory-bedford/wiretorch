@@ -13,7 +13,8 @@ follow line for line. One step, for every neuron of every trial:
    pathway adds its activation (presynaptic spikes times weights) times its kernel.
 
 Gradients flow through the voltage and conductances (backprop through time), into the
-spikes only via the surrogate, and never through the reset or through recurrent spikes.
+spikes only via the surrogate, and never through the reset. They flow through the
+recurrent spikes, into the presynaptic neurons, only if ``drive.recurrent_gradients``.
 """
 
 from __future__ import annotations
@@ -122,7 +123,8 @@ def simulate(
         if probabilities:
             probs.append(torch.sigmoid(p.surr_scale * (v - p.theta)))
         v_next, I, I_leak = membrane(v, s, g, p)
-        activations = [s.detach()[:, rows] @ W for rows, W in drive.recurrent]
+        s_rec = s if drive.recurrent_gradients else s.detach()
+        activations = [s_rec[:, rows] @ W for rows, W in drive.recurrent]
         activations += list(A_ff[:, :, t])
         g = g * p.decay
         for a, kernel in zip(activations, kernels):

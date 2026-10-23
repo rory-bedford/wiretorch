@@ -24,9 +24,9 @@ therefore hold counts per step — spikes; a continuous rate ``rho`` enters as
 same model with weights ``(1 - beta)`` times these at a given dt, but a different one
 whenever dt changed; ``from_weights`` converts weights written for it.)
 
-Unlike the conductance-based networks, gradients flow through the recurrent spikes
-(into the presynaptic neurons, via the surrogate) as well as through the voltage and
-currents; never through the reset.
+Gradients flow through the voltage and currents, never through the reset, and — if
+``drive.recurrent_gradients``, the current-based networks' default — through the
+recurrent spikes (into the presynaptic neurons, via the surrogate).
 """
 
 from __future__ import annotations
@@ -121,8 +121,9 @@ def simulate(
         s = spike(v, p)
         if probabilities:
             probs.append(torch.sigmoid(p.surr_scale * (v - p.theta)))
-        # Not detached: the gradient reaches the presynaptic neurons' surrogates.
-        activations = [s[:, rows] @ W for rows, W in drive.recurrent]
+        # Unless detached, the gradient reaches the presynaptic neurons' surrogates.
+        s_rec = s if drive.recurrent_gradients else s.detach()
+        activations = [s_rec[:, rows] @ W for rows, W in drive.recurrent]
         activations += list(A_ff[:, :, t])
         I = I * p.decay
         for a, jump in zip(activations, jumps):

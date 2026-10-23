@@ -9,9 +9,13 @@ the kernels of ``kernels.py``:
 * A recurrent network takes two launches per step: ``compact_spikes`` lists who fired,
   ``recurrent_step`` gathers just those weight rows and integrates.
 * With gradients, the forward pass saves the voltage, conductances and recurrent
-  activations of every step, and ``scan_backward`` is the reverse-time adjoint. It also
-  gives learnt physiology its gradient, each term compiled in only when that parameter
-  is learnt, from nothing more saved than the conductances entering the chunk.
+  activations of every step, and ``scan_backward`` is the reverse-time adjoint — unless
+  gradients flow through the recurrent spikes (``Drive.recurrent_gradients``), which
+  couples the neurons: the backward pass is then a reverse loop over steps,
+  ``inject_backward``, a product with ``W^T`` carrying each pathway's ``dL/da`` to the
+  presynaptic spikes, and ``spike_backward``. Either also gives learnt physiology its
+  gradient, each term compiled in only when that parameter is learnt, from nothing more
+  saved than the conductances entering the chunk.
 
 Set ``WIRETORCH_BACKEND=torch`` to force the reference implementation. What the
 families share — the dispatch rule, sparse feedforward input — is in
@@ -20,7 +24,6 @@ families share — the dispatch rule, sparse feedforward input — is in
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass, replace
 
 import torch
@@ -36,9 +39,11 @@ from wiretorch.network_simulators.engine import (  # noqa: F401 - re-exported
     _SparseActivations,
     activations as _activations,
     pad as _pad,
+    presynaptic_blocks,
     row_start as _row_start,
     triton,
     uses_kernels,
+    weight_gradient,
 )
 
 if triton is not None:
@@ -95,6 +100,8 @@ class _Launch:
     dummy: torch.Tensor  # stands in for unused pointer arguments
     #: Which physiology gradients are wanted, in ``PHYSIOLOGY`` order.
     wants: tuple[bool, ...] = (False,) * 8
+    #: Whether gradients flow through the recurrent spikes (see ``Drive``).
+    recurrent_gradients: bool = False
 
     @property
     def K(self) -> int:
@@ -127,7 +134,7 @@ def _physiology_grads(L: _Launch, device) -> list[torch.Tensor]:
     """Zeroed per-(trial, [synapse,] neuron) accumulators of the gradients wanted."""
     shapes = [(L.B, L.N)] * 5 + [(L.B, L.S, L.N)] + [(L.B, 2, L.S, L.N)] * 2
     return [
-        torch.empty(shape, device=device) if want else L.dummy
+        torch.zeros(shape, device=device) if want else L.dummy
         for shape, want in zip(shapes, L.wants)
     ]
 
@@ -167,6 +174,7 @@ def _prepare(v, x, drive, p, probabilities, track, track_batch_idx) -> _Launch:
         track_b=(-1 if track_batch_idx is None else track_batch_idx) if track else 0,
         tracked=tracked, dummy=dummy,
         wants=tuple(getattr(p, name).requires_grad for name in PHYSIOLOGY),
+        recurrent_gradients=drive.recurrent_gradients,
     )  # fmt: skip
 
 
@@ -259,6 +267,51 @@ def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
     )
 
 
+def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_scale):
+    """The reverse loop over steps, when gradients flow through the recurrent spikes:
+    returns ``(grad_A, grad_scale, *physiology)``.
+
+    ``grad_A`` ``(K, B, T, N)`` is always computed: its recurrent part is what reaches
+    the presynaptic spikes. ``grad_scale`` and the physiology are None unless wanted.
+    ``saved`` is ``(spikes, v_saved, G_saved, g_init)``.
+    """
+    spikes, v_saved, G_saved, g_init = saved
+    block = L.backward_block()
+    grid = (triton.cdiv(L.B * L.N, block),)
+    lv = torch.zeros((L.B, L.N), device=A.device)
+    lg = torch.zeros((L.B, 2, L.S, L.N), device=A.device)
+    R = torch.zeros((L.B, L.N), device=A.device)  # dL/ds through the recurrence
+    grad_A = torch.empty_like(A)
+    partial = torch.zeros((L.K, L.B, L.N), device=A.device) if want_scale else L.dummy
+    physiology = _physiology_grads(L, A.device)
+    g_theta, *rest = physiology
+    H = torch.zeros_like(lg) if L.wants[6] else L.dummy
+    flags = L.flags()
+    want_theta = flags.pop("WANT_THETA")
+    blocks = presynaptic_blocks(W, rows, sizes, L.p.storage_dtype)
+    grad_spikes = grad_spikes.contiguous()
+    for t in reversed(range(L.T)):
+        kernels.inject_backward[grid](
+            lv, lg, H, spikes, v_saved, G_saved, A, scale, L.made, L.jump, L.decay,
+            L.E_syn, L.g_clip, L.p.E_L, L.p.C_m, L.p.beta, grad_A, partial, *rest,
+            L.p.dt, t, L.B, L.T, L.N,
+            K=L.K, S=L.S, SP=L.SP, BLOCK=block, WANT_SCALE=want_scale, **flags,
+        )  # fmt: skip
+        for k, (source, carry) in enumerate(blocks):
+            R.index_copy_(1, source, carry(grad_A[k, :, t]))
+        kernels.spike_backward[grid](
+            lv, v_saved, grad_spikes, R, L.p.theta, g_theta, L.p.surr_scale,
+            t, L.B, L.T, L.N, BLOCK=block, SAMPLE=L.sample, WANT_THETA=want_theta,
+        )  # fmt: skip
+    if L.wants[6]:
+        physiology[6] += g_init * H  # the conductances entering the chunk
+    return (
+        grad_A,
+        partial.sum(dim=1) if want_scale else None,
+        *_reduce(physiology, L.wants),
+    )
+
+
 # =====================================================================
 # Autograd
 # =====================================================================
@@ -312,30 +365,31 @@ class _RecurrentRun(torch.autograd.Function):
         g_init = L.g_init(g)
         _recurrent(L, [(0, A_ff)], W, rows, sizes, scale, v, g, spikes, saved)
         ctx.L, ctx.rows, ctx.sizes = L, rows, sizes
-        ctx.save_for_backward(A_ff, scale, spikes, *saved, g_init)
+        # W is needed only to carry gradients through the recurrent spikes.
+        kept = W if L.recurrent_gradients else L.dummy
+        ctx.save_for_backward(A_ff, scale, kept, spikes, *saved, g_init)
         ctx.mark_non_differentiable(v, g)
         return spikes, v, g
 
     @staticmethod
     def backward(ctx, grad_spikes, _v, _g):
-        A_ff, scale, spikes, v_saved, G_saved, A_rec, g_init = ctx.saved_tensors
-        L = ctx.L
+        A_ff, scale, W, spikes, v_saved, G_saved, A_rec, g_init = ctx.saved_tensors
+        L, rows, sizes = ctx.L, ctx.rows, ctx.sizes
         want_ff, want_scale, want_W = ctx.needs_input_grad[:3]
-        A = torch.cat([A_rec, A_ff]) if L.K_ff else A_rec
-        grad_A, grad_scale, *physiology = _backward(
-            L, (spikes, v_saved, G_saved, g_init), A, scale, grad_spikes, None,
-            want_A=want_ff or want_W, want_scale=want_scale,
-        )  # fmt: skip
-        grad_W = None
-        if want_W:
-            # dL/dW_k = sum over (trial, step) of presynaptic spikes x dL/dA_k.
-            pieces, starts = [], [0, *itertools.accumulate(ctx.sizes)]
-            for k in range(L.K_rec):
-                pre = spikes[:, :, ctx.rows[starts[k] : starts[k + 1]]]
-                pieces.append(
-                    pre.reshape(-1, pre.shape[-1]).T @ grad_A[k].reshape(-1, L.N)
-                )
-            grad_W = torch.cat(pieces)
+        if grad_spikes is None:
+            grad_spikes = torch.zeros_like(spikes)
+        A = (torch.cat([A_rec, A_ff]) if L.K_ff else A_rec).contiguous()
+        saved = (spikes, v_saved, G_saved, g_init)
+        if L.recurrent_gradients:
+            grad_A, grad_scale, *physiology = _recurrent_backward(
+                L, saved, A, scale, W, rows, sizes, grad_spikes, want_scale
+            )
+        else:  # the recurrent activations are input like any other: one reverse scan
+            grad_A, grad_scale, *physiology = _backward(
+                L, saved, A, scale, grad_spikes, None,
+                want_A=want_ff or want_W, want_scale=want_scale,
+            )  # fmt: skip
+        grad_W = weight_gradient(spikes, rows, sizes, grad_A) if want_W else None
         grad_ff = grad_A[L.K_rec :] if want_ff else None
         return grad_ff, grad_scale, grad_W, None, None, None, None, None, *physiology
 

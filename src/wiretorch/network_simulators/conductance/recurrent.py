@@ -23,7 +23,8 @@ class ConductanceLIFNetwork(ConductanceNetwork):
     external input through ``ff_projections``, both dicts mapping
     ``(source_cell_type_name, target_cell_type_name)`` to a ``Projection``. Synapse
     types with the same (cell type, synapse) signature on both sides share one
-    conductance (``unified_synapse_params``).
+    conductance (``unified_synapse_params``). Gradients flow through the recurrent
+    spikes only if ``recurrent_gradients`` is True (``CurrentLIFNetwork``'s default).
 
     The state (``v``, ``g``) continues across ``forward`` calls, so a long simulation
     can be run in chunks; call ``reset_state()`` before an independent one.
@@ -56,6 +57,7 @@ class ConductanceLIFNetwork(ConductanceNetwork):
         track_batch_idx: int | None = None,
         storage_dtype: torch.dtype | str = torch.float32,
         learn: dict | None = None,
+        recurrent_gradients: bool = False,
     ):
         """
         Args:
@@ -82,6 +84,11 @@ class ConductanceLIFNetwork(ConductanceNetwork):
                 ``U_reset``, ``E_L``, ``g_L``) or synapse type (``tau_rise``,
                 ``tau_decay``, ``E_syn``, ``g_bar``): True for every type or a list of
                 names (see ``ConductanceNetwork``).
+            recurrent_gradients: Whether gradients flow through the recurrent spikes
+                into the presynaptic neurons (via their surrogates), as well as through
+                the voltages and synaptic states; if not, each step's recurrent input
+                is treated as given. Default False, whose backward pass is one reverse
+                scan; True steps back one step at a time.
         """
         self.synapse_params = synapse_params
         self.cell_params_FF = cell_params_FF
@@ -115,6 +122,7 @@ class ConductanceLIFNetwork(ConductanceNetwork):
             learn=learn,
         )  # fmt: skip
         self.register_buffer("cell_type_indices_FF", _long(cell_type_indices_FF))
+        self.recurrent_gradients = recurrent_gradients
 
     def forward(
         self, input_spikes: torch.Tensor | np.ndarray

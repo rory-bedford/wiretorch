@@ -4,15 +4,16 @@ They implement exactly the time step of ``dynamics.py`` (the readable reference)
 so that a neuron's state never leaves registers within a chunk:
 
 * ``scan_forward`` / ``scan_backward`` integrate a chunk whose synaptic drive is known
-  in advance (feedforward networks) — one launch per chunk, the time loop inside the
-  kernel, BPTT as the matching reverse scan.
+  in advance (feedforward networks, and the backward pass of a recurrent network whose
+  gradients do not flow through its spikes) — one launch per chunk, the time loop
+  inside the kernel, BPTT as the matching reverse scan.
 * ``compact_spikes`` (shared, ``network_simulators.kernels``) + ``recurrent_step``
   advance a recurrent network by one step, gathering only the weight rows of the
   neurons that fired.
-* ``inject_backward`` + ``spike_backward`` step a recurrent network's adjoint back by
-  one step. Gradients flow through the recurrent spikes, which couples the neurons:
-  between the two, the engine carries each pathway's ``dL/da`` back to the presynaptic
-  spikes with a matmul by ``W^T``.
+* ``inject_backward`` + ``spike_backward`` (shared) step a recurrent network's adjoint
+  back by one step when gradients flow through the recurrent spikes (the default),
+  which couples the neurons: between the two, the engine carries each pathway's
+  ``dL/da`` back to the presynaptic spikes with a matmul by ``W^T``.
 
 Layouts (all contiguous float32 unless noted):
 
@@ -51,9 +52,11 @@ import triton
 import triton.language as tl
 
 from wiretorch.network_simulators.kernels import (  # noqa: F401 - re-exported
+    _accumulate,
     _spike,
     _spike_adjoint,
     compact_spikes,
+    spike_backward,
 )
 
 
@@ -68,12 +71,6 @@ def _membrane(v, s, I, sign, U_reset, beta, U_rest, R):
     """The voltage after the step: leak, signed synaptic currents, reset."""
     I_syn = tl.sum(I * sign[None, :], axis=1)
     return (beta * v + (1 - beta) * (U_rest + R * I_syn)) * (1 - s) + U_reset * s
-
-
-@triton.jit
-def _accumulate(pointer, value, mask):
-    """``*pointer += value`` (one program owns each element)."""
-    tl.store(pointer, tl.load(pointer, mask=mask, other=0.0) + value, mask=mask)
 
 
 @triton.jit
@@ -456,29 +453,3 @@ def inject_backward(
         tl.store(H_row, gJ + dc[None, :] * H, mask=sm)
     tl.store(I_row, gJ * dc[None, :], mask=sm)
     tl.store(lv + idx, v_adj * (1 - s) * beta_n, mask=live)
-
-
-@triton.jit
-def spike_backward(
-    lv, v_saved, grad_spikes, R, theta, grad_theta, surr_ptr, t, B, T, N,
-    BLOCK: tl.constexpr, SAMPLE: tl.constexpr, WANT_THETA: tl.constexpr,
-):  # fmt: skip
-    """Add step ``t``'s spike term to dL/dv: the surrogate of the spike's gradient.
-
-    The spike's gradient is the loss's (``grad_spikes``) plus ``R`` ``(B, N)``, what
-    the recurrent activations of step ``t`` pass back to it. The spike is a function
-    of ``v - theta``, so ``theta``'s gradient is the same term, negated.
-    """
-    surr_scale = tl.load(surr_ptr)
-    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    live = idx < B * N
-    b = idx // N
-    n = idx % N
-    out = (b * T + t) * N + n
-    x = tl.load(v_saved + out, mask=live) - tl.load(theta + n, mask=live)
-    gs = tl.load(grad_spikes + out, mask=live, other=0.0)
-    gs += tl.load(R + idx, mask=live, other=0.0)
-    gx = _spike_adjoint(x, gs, surr_scale, SAMPLE)
-    _accumulate(lv + idx, gx, live)
-    if WANT_THETA:
-        _accumulate(grad_theta + idx, -gx, live)

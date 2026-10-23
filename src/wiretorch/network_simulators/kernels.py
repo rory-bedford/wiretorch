@@ -1,9 +1,14 @@
 """Triton kernels every spiking family shares: the spike (and its surrogate gradient),
-and the spike compaction.
+the spike compaction, and the spike's step of a recurrent backward pass.
 
 A recurrent step starts with ``compact_spikes``, which lists, per trial and recurrent
 pathway, the source neurons that fire now; the family's ``recurrent_step`` then gathers
 only those weight rows (spikes are sparse, ~1% of neurons per ms).
+
+When gradients flow through the recurrent spikes, the backward pass steps back one step
+at a time: the family's ``inject_backward`` gives each pathway's ``dL/da``, the engine
+carries it to the presynaptic spikes (``R = dL/da W^T``), and ``spike_backward`` adds
+the spikes' surrogate gradient to the voltages' adjoints.
 """
 
 import triton
@@ -64,3 +69,35 @@ def compact_spikes(
         tl.store(lists + (k * B + b) * L + position, r, mask=fired)
         count += tl.sum(fired.to(tl.int32), axis=0)
     tl.store(counts + k * B + b, count)
+
+
+@triton.jit
+def _accumulate(pointer, value, mask):
+    """``*pointer += value`` (one program owns each element)."""
+    tl.store(pointer, tl.load(pointer, mask=mask, other=0.0) + value, mask=mask)
+
+
+@triton.jit
+def spike_backward(
+    lv, v_saved, grad_spikes, R, theta, grad_theta, surr_ptr, t, B, T, N,
+    BLOCK: tl.constexpr, SAMPLE: tl.constexpr, WANT_THETA: tl.constexpr,
+):  # fmt: skip
+    """Add step ``t``'s spike term to dL/dv: the surrogate of the spike's gradient.
+
+    The spike's gradient is the loss's (``grad_spikes``) plus ``R`` ``(B, N)``, what
+    the recurrent activations of step ``t`` pass back to it. The spike is a function
+    of ``v - theta``, so ``theta``'s gradient is the same term, negated.
+    """
+    surr_scale = tl.load(surr_ptr)
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = idx < B * N
+    b = idx // N
+    n = idx % N
+    out = (b * T + t) * N + n
+    x = tl.load(v_saved + out, mask=live) - tl.load(theta + n, mask=live)
+    gs = tl.load(grad_spikes + out, mask=live, other=0.0)
+    gs += tl.load(R + idx, mask=live, other=0.0)
+    gx = _spike_adjoint(x, gs, surr_scale, SAMPLE)
+    _accumulate(lv + idx, gx, live)
+    if WANT_THETA:
+        _accumulate(grad_theta + idx, -gx, live)

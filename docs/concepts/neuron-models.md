@@ -22,8 +22,8 @@ exponentials is normalised to peak at $\bar g$). In each step the leak and the
 conductances decay exactly, and the synaptic currents take a forward-Euler step.
 
 Gradients flow through the voltage and the conductances using a surrogate for the
-spike. They do not flow through recurrent spikes: the effect of a neuron's spike on
-other neurons is treated as input.
+spike. By default they do not flow through recurrent spikes: the effect of a neuron's
+spike on other neurons is treated as input (see [below](#gradients-through-recurrent-spikes)).
 
 ## Current-based LIF
 
@@ -38,8 +38,22 @@ $$
 where $\sigma_s = \pm 1$ is the sign of the synapse type. The step uses exponential
 Euler, normalised so that one spike moves the voltage by $R w \tau_s / \tau_m$
 independent of the time step. The defaults are natural units: $\theta = 1$,
-$U_\text{reset} = U_\text{rest} = 0$, $R = 1$. Gradients also flow through recurrent
-spikes.
+$U_\text{reset} = U_\text{rest} = 0$, $R = 1$. By default gradients also flow
+through recurrent spikes.
+
+## Gradients through recurrent spikes
+
+In a recurrent spiking network, a spike reaches the loss directly and also through the
+neurons it drives. `recurrent_gradients=True` carries the gradient along that second
+path too, back through the recurrent weights into the presynaptic neuron's surrogate.
+With `False`, each step's recurrent input is treated as given; the gradients still reach
+the recurrent weights and scaling factors, and the voltages and synaptic states, but
+not the spiking neurons upstream.
+
+Both families support both settings. The default is `False` for
+`ConductanceLIFNetwork` and `True` for `CurrentLIFNetwork`. `False` is about 3x faster
+to train on a GPU, because the backward pass is a single reverse scan. With `True`, all
+neurons are coupled at every step, so the backward pass steps back one step at a time.
 
 ## Rate
 

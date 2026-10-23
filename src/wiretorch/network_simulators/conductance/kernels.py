@@ -4,12 +4,18 @@ They implement exactly the time step of ``dynamics.py`` (the readable reference)
 so that a neuron's state never leaves registers within a chunk:
 
 * ``scan_forward`` / ``scan_backward`` integrate a chunk whose synaptic drive is known
-  in advance (feedforward networks, and the backward pass of every network) — one
-  launch per chunk, the time loop inside the kernel, BPTT as the matching reverse scan.
+  in advance (feedforward networks, and the backward pass of a recurrent network whose
+  gradients do not flow through its spikes) — one launch per chunk, the time loop
+  inside the kernel, BPTT as the matching reverse scan.
 * ``compact_spikes`` (shared, ``network_simulators.kernels``) + ``recurrent_step``
   advance a recurrent network by one step.
   Spikes are sparse (~1% of neurons per ms), so instead of a dense ``spikes @ W``
   each step gathers only the weight rows of the neurons that fired.
+* ``inject_backward`` + ``spike_backward`` (shared) step a recurrent network's adjoint
+  back by one step when gradients flow through the recurrent spikes, which couples the
+  neurons: between the two, the engine carries each pathway's ``dL/da`` back to the
+  presynaptic spikes with a matmul by ``W^T``. They share the per-step maths of
+  ``scan_backward`` (``_injection``, ``_membrane_adjoint``).
 
 Layouts (all contiguous float32 unless noted):
 
@@ -26,7 +32,7 @@ network's ``storage_dtype``): loads convert them to float32, stores round back.
 ``K`` pathways (one per source cell type and input side), ``S`` synapse types. A padded
 synapse column has zero jump, decay and clip, so it stays at zero and adds no current.
 
-Learnt physiology gets its gradient from ``scan_backward`` too, each term compiled in
+Learnt physiology gets its gradient from the backward kernels too, each term compiled in
 only when it is learnt: per neuron ``theta``, ``U_reset``, ``E_L``, ``C_m`` and ``beta``,
 per synapse type ``E_syn`` and per component the ``jump`` and ``decay``, summed per
 (trial, [synapse,] neuron) — the engine sums over trials. Nothing more is saved: the
@@ -41,8 +47,11 @@ import triton
 import triton.language as tl
 
 from wiretorch.network_simulators.kernels import (  # noqa: F401 - re-exported
+    _accumulate,
     _spike,
+    _spike_adjoint,
     compact_spikes,
+    spike_backward,
 )
 
 
@@ -168,6 +177,54 @@ def _store_pair(pointer, rise, decay, b, n, j, sm, S: tl.constexpr, N):
 
 
 @triton.jit
+def _injection(A, scale, made, stride, out, n, j, live, N, K: tl.constexpr,
+               SP: tl.constexpr, BLOCK: tl.constexpr):  # fmt: skip
+    """What step ``t`` injects per unit jump, ``sum_k a_k scale_k made_k``
+    ``(BLOCK, SP)``; ``A + out`` points at pathway 0's activations of the step."""
+    base = tl.zeros((BLOCK, SP), dtype=tl.float32)
+    for k in tl.static_range(K):
+        a = tl.load(A + k * stride + out, mask=live, other=0.0)
+        sc = tl.load(scale + k * N + n, mask=live, other=0.0)
+        mk = tl.load(made + k * SP + j)
+        base += (a * sc)[:, None] * mk[None, :]
+    return base
+
+
+@triton.jit
+def _membrane_adjoint(
+    dv, s, v, G, E, clip, E_L, C_m, beta, dt,
+    acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E,
+    WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr, WANT_BETA: tl.constexpr,
+    WANT_C_M: tl.constexpr, WANT_E_SYN: tl.constexpr,
+):  # fmt: skip
+    """Step ``dv`` (dL/dv after the step) back through the membrane update
+    ``v_next = (v - (sum_j I_j + I_leak) dt / C) (1 - s) + U s``.
+
+    Returns dL/dv entering the step (without its spike term), dL/dG of the summed
+    conductances it read, and the accumulators with this step's terms added.
+    """
+    Gc = tl.minimum(tl.maximum(G, 0.0), clip[None, :])
+    gx = dv * (1 - s)
+    gy = -gx * dt / C_m
+    clamp = tl.where(G < clip[None, :], 1.0, tl.where(G == clip[None, :], 0.5, 0.0))
+    clamp = tl.where(G >= 0.0, clamp, 0.0)
+    dG = gy[:, None] * (v[:, None] - E[None, :]) * clamp
+    if WANT_RESET:
+        acc_reset += dv * s
+    if WANT_E_L:
+        acc_E_L += gx * (1 - beta)
+    if WANT_BETA:
+        acc_beta += gx * (v - E_L)
+    if WANT_C_M:  # d/dC_m of -(sum_j I_j) dt / C_m
+        I_syn = tl.sum(Gc * (v[:, None] - E[None, :]), axis=1)
+        acc_C_m -= gy * I_syn / C_m
+    if WANT_E_SYN:
+        acc_E -= gy[:, None] * Gc
+    dv = gx + gy * (tl.sum(Gc, axis=1) + (1 - beta) * C_m / dt)
+    return dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E
+
+
+@triton.jit
 def scan_backward(
     grad_spikes, grad_prob, spikes, v_saved, G_saved, g_init, A, scale, made, jump,
     decay, E_syn, g_clip, theta, E_L, C_m, beta, grad_A, grad_scale,
@@ -235,12 +292,9 @@ def scan_backward(
         # The jumps and decays: the injection of step t per unit jump, and the
         # components' adjoints after it (lr, ld).
         if WANT_DECAY or WANT_JUMP:
-            base = tl.zeros((BLOCK, SP), dtype=tl.float32)
-            for k in tl.static_range(K):
-                a = tl.load(A + k * (B * T * N) + out, mask=live, other=0.0)
-                sc = tl.load(scale + k * N + n, mask=live, other=0.0)
-                mk = tl.load(made + k * SP + j)
-                base += (a * sc)[:, None] * mk[None, :]
+            base = _injection(
+                A, scale, made, B * T * N, out, n, j, live, N, K, SP, BLOCK
+            )
             if WANT_JUMP:
                 acc_jump_r += lr * base
                 acc_jump_d += ld * base
@@ -263,34 +317,16 @@ def scan_backward(
                 a = tl.load(A + k * (B * T * N) + out, mask=live, other=0.0)
                 acc += tl.where(kk[None, :] == k, (q * a)[:, None], 0.0)
 
-        # Membrane update: v_next = (v - (sum_j I_j + I_leak) dt / C) (1 - s) + U s.
-        Gc = tl.minimum(tl.maximum(G, 0.0), clip[None, :])
-        gx = dv * (1 - s)
-        gy = -gx * dt / C_m_n
-        clamp = tl.where(G < clip[None, :], 1.0, tl.where(G == clip[None, :], 0.5, 0.0))
-        clamp = tl.where(G >= 0.0, clamp, 0.0)
-        dG = gy[:, None] * (v[:, None] - E[None, :]) * clamp
-        if WANT_RESET:
-            acc_reset += dv * s
-        if WANT_E_L:
-            acc_E_L += gx * (1 - beta_n)
-        if WANT_BETA:
-            acc_beta += gx * (v - E_L_n)
-        if WANT_C_M:  # d/dC_m of -(sum_j I_j) dt / C_m
-            I_syn = tl.sum(Gc * (v[:, None] - E[None, :]), axis=1)
-            acc_C_m -= gy * I_syn / C_m_n
-        if WANT_E_SYN:
-            acc_E -= gy[:, None] * Gc
-        dv = gx + gy * (tl.sum(Gc, axis=1) + (1 - beta_n) * C_m_n / dt)
+        dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E = _membrane_adjoint(
+            dv, s, v, G, E, clip, E_L_n, C_m_n, beta_n, dt,
+            acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E,
+            WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN,
+        )  # fmt: skip
 
         # Spike (surrogate) and probability outputs of step t, both of v - theta.
         x = v - theta_n
         gs = tl.load(grad_spikes + out, mask=live, other=0.0)
-        if SAMPLE:
-            p = tl.sigmoid(surr_scale * x)
-            g_x = gs * surr_scale * p * (1.0 - p)
-        else:
-            g_x = gs / ((surr_scale * tl.abs(x) + 1.0) * (surr_scale * tl.abs(x) + 1.0))
+        g_x = _spike_adjoint(x, gs, surr_scale, SAMPLE)
         if PROB:
             p = tl.sigmoid(surr_scale * x)
             g_x += (
@@ -425,3 +461,95 @@ def recurrent_step(
             track_v, track_I, track_g, b, n, t, T, N, j, live,
             v_next, I, I_leak, gr, gd, track_b, S,
         )  # fmt: skip
+
+
+@triton.jit
+def inject_backward(
+    lv, lg, H_state, spikes, v_saved, G_saved, A, scale, made, jump, decay, E_syn,
+    g_clip, E_L, C_m, beta, grad_A, grad_scale, grad_reset, grad_E_L, grad_C_m,
+    grad_beta, grad_E_syn, grad_decay, grad_jump, dt_ptr, t, B, T, N,
+    K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
+    WANT_SCALE: tl.constexpr, WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr,
+    WANT_C_M: tl.constexpr, WANT_BETA: tl.constexpr, WANT_E_SYN: tl.constexpr,
+    WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr,
+):  # fmt: skip
+    """Step the adjoint back through the integration and injection of step ``t``.
+
+    ``lv`` ``(B, N)`` and ``lg`` ``(B, 2, S, N)`` hold dL/dv and dL/dg after the step.
+    Writes ``grad_A[:, :, t]`` (dL/da of every pathway), adds to ``grad_scale`` and the
+    physiology gradients wanted, and leaves in ``lv``, ``lg`` the adjoints of the state
+    entering the step — ``lv`` still without its spike term, which needs every
+    neuron's dL/da (``spike_backward``). ``H_state`` ``(B, 2, S, N)`` carries the
+    decays' ``H`` (see the module docstring); the engine adds the initial
+    conductances' term. One step of ``scan_backward``, but for the spike term.
+    """
+    dt = tl.load(dt_ptr)
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = idx < B * N
+    b = idx // N
+    n = idx % N
+    j = tl.arange(0, SP)
+    sm = live[:, None] & (j[None, :] < S)
+
+    E = tl.load(E_syn + j)
+    clip = tl.load(g_clip + j)
+    jump_r, jump_d = tl.load(jump + j), tl.load(jump + SP + j)
+    decay_r, decay_d = tl.load(decay + j), tl.load(decay + SP + j)
+
+    dv = tl.load(lv + idx, mask=live, other=0.0)
+    rows = (b * (2 * S * N) + n)[:, None] + j[None, :] * N
+    lr = tl.load(lg + rows, mask=sm, other=0.0)
+    ld = tl.load(lg + rows + S * N, mask=sm, other=0.0)
+    out = (b * T + t) * N + n
+    v = tl.load(v_saved + out, mask=live, other=0.0)
+    s = tl.load(spikes + out, mask=live, other=0.0)
+    G = tl.load(G_saved + out[:, None] * S + j[None, :], mask=sm, other=0.0)
+    G = G.to(tl.float32)
+
+    # The jumps and decays, as in scan_backward.
+    if WANT_DECAY or WANT_JUMP:
+        base = _injection(A, scale, made, B * T * N, out, n, j, live, N, K, SP, BLOCK)
+        if WANT_JUMP:
+            _accumulate(grad_jump + rows, lr * base, sm)
+            _accumulate(grad_jump + rows + S * N, ld * base, sm)
+        if WANT_DECAY:
+            H_r = tl.load(H_state + rows, mask=sm, other=0.0)
+            H_d = tl.load(H_state + rows + S * N, mask=sm, other=0.0)
+            _accumulate(grad_decay + rows, jump_r[None, :] * base * H_r, sm)
+            _accumulate(grad_decay + rows + S * N, jump_d[None, :] * base * H_d, sm)
+            tl.store(H_state + rows, lr + decay_r[None, :] * H_r, mask=sm)
+            tl.store(H_state + rows + S * N, ld + decay_d[None, :] * H_d, mask=sm)
+
+    # The injections of step t enter the state that step t + 1 sees.
+    for k in tl.static_range(K):
+        mk = tl.load(made + k * SP + j)
+        q = tl.sum((jump_r[None, :] * lr + jump_d[None, :] * ld) * mk[None, :], axis=1)
+        sc = tl.load(scale + k * N + n, mask=live, other=0.0)
+        tl.store(grad_A + k * (B * T * N) + out, q * sc, mask=live)
+        if WANT_SCALE:
+            a = tl.load(A + k * (B * T * N) + out, mask=live, other=0.0)
+            _accumulate(grad_scale + k * (B * N) + idx, q * a, live)
+
+    zero = tl.zeros((BLOCK,), dtype=tl.float32)
+    dv, dG, g_reset, g_E_L, g_beta, g_C_m, g_E = _membrane_adjoint(
+        dv, s, v, G, E, clip,
+        tl.load(E_L + n, mask=live), tl.load(C_m + n, mask=live, other=1.0),
+        tl.load(beta + n, mask=live), dt,
+        zero, zero, zero, zero, tl.zeros((BLOCK, SP), dtype=tl.float32),
+        WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN,
+    )  # fmt: skip
+    if WANT_RESET:
+        _accumulate(grad_reset + idx, g_reset, live)
+    if WANT_E_L:
+        _accumulate(grad_E_L + idx, g_E_L, live)
+    if WANT_BETA:
+        _accumulate(grad_beta + idx, g_beta, live)
+    if WANT_C_M:
+        _accumulate(grad_C_m + idx, g_C_m, live)
+    if WANT_E_SYN:
+        _accumulate(grad_E_syn + (b * (S * N) + n)[:, None] + j[None, :] * N, g_E, sm)
+
+    # Conductances decay into the next step and feed the currents of this one.
+    tl.store(lv + idx, dv, mask=live)
+    tl.store(lg + rows, lr * decay_r[None, :] + dG, mask=sm)
+    tl.store(lg + rows + S * N, ld * decay_d[None, :] + dG, mask=sm)
