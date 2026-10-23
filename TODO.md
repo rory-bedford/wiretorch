@@ -41,5 +41,7 @@ Discussed and deferred (October 2026):
 - **Subtractive reset** (`v <- v - theta`).
 - **Target-side receptor saturation** (a smooth `g_clip`):
   `dG_i/dt = -G_i / tau + (1 - G_i / g_max) input_i`.
-- **Gradients through the presynaptic gating** (saturation, and STP when it lands): the
-  state depends only on the source's own spikes, so a per-source reverse scan.
+- **Gradients through the presynaptic state** (saturation, short-term plasticity), and
+  so learnable STP parameters and saturating types' `tau_decay`: the state depends only
+  on the source's own spikes, so a per-source reverse scan.
+- **An adaptive threshold** (ALIF, as in LSNNs) alongside the adaptation current.
