@@ -12,10 +12,23 @@ Each synapse type $s$ has a conductance made of a rise and a decay component. Th
 synaptic current depends on the voltage through the reversal potential:
 
 $$
-C_m \frac{dv}{dt} = -g_L (v - E_L) - \sum_s \min(\max(g_s, 0), g^{\text{clip}}_s)\,(v - E_s)
+C_m \frac{dv}{dt} = -g_L (v - E_L) - \sum_s B_s(v)\,\min(\max(g_s, 0), g^{\text{clip}}_s)\,(v - E_s)
 $$
 
-with $C_m = \tau_m g_L$. When $v$ crosses $\theta$ the neuron spikes and $v$ is reset to
+with $C_m = \tau_m g_L$. $B_s(v) = 1$ unless the synapse type has a voltage-dependent
+Mg²⁺ block, as NMDA receptors do (Jahr & Stevens, 1990):
+
+$$
+B_s(v) = \frac{1}{1 + \frac{[\text{Mg}^{2+}]_s}{K_s}\, e^{-a_s v}}
+$$
+
+set per synapse type by `mg` ($[\text{Mg}^{2+}]$ in mM, default 0: no block; 1.0 is
+physiological), `mg_slope` ($a$, default 0.062 /mV) and `mg_k` ($K$, default 3.57 mM).
+The block scales the current, not the conductance, so NMDA's rise and decay are set by
+`tau_rise` and `tau_decay` as for any synapse type. The Mg parameters are fixed: they
+cannot be learnt.
+
+When $v$ crosses When $v$ crosses $\theta$ the neuron spikes and $v$ is reset to
 $U_\text{reset}$. An input spike increases the conductance of each synapse type its
 source makes by the weight times the peak conductance $\bar g$ (the difference of
 exponentials is normalised to peak at $\bar g$). In each step the leak and the

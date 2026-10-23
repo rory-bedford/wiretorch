@@ -26,6 +26,8 @@ class SynapseConfig(Config):
     """Synapse parameters for conductance-based models.
 
     Supports multiple synapse types per cell type (e.g., AMPA and NMDA for excitatory cells).
+    NMDA's voltage dependence is set by ``mg`` (e.g. 1.0 mM for each NMDA type, 0 for the
+    others), with optional ``mg_slope`` and ``mg_k``.
     """
 
     names: List[str]  # Synapse type names (e.g., ["AMPA", "NMDA"])
@@ -36,6 +38,11 @@ class SynapseConfig(Config):
         alias="g_bar"
     )  # Conductance waveform scaling factors (nS)
     g_clip_list: Optional[List[float]] = Field(default=None, alias="g_clip")
+    # The voltage-dependent Mg²⁺ block (NMDA): [Mg²⁺] (mM; 0 or unset: no block), slope
+    # (1/mV, default 0.062) and dissociation constant (mM, default 3.57).
+    mg_list: Optional[List[float]] = Field(default=None, alias="mg")
+    mg_slope_list: Optional[List[float]] = Field(default=None, alias="mg_slope")
+    mg_k_list: Optional[List[float]] = Field(default=None, alias="mg_k")
 
     @property
     def tau_rise(self) -> np.ndarray:

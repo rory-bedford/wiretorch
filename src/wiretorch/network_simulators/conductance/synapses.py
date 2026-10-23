@@ -36,6 +36,26 @@ def synapse_tables(registry: SynapseRegistry) -> dict[str, torch.Tensor]:
     return tables
 
 
+#: Defaults of the Mg²⁺ block's parameters: none (``mg``, mM), and the Jahr–Stevens
+#: slope (``mg_slope``, 1/mV) and dissociation constant (``mg_k``, mM).
+MG, MG_SLOPE, MG_K = 0.0, 0.062, 3.57
+
+
+def mg_block_tables(registry: SynapseRegistry) -> dict[str, torch.Tensor]:
+    """The voltage-dependent Mg²⁺ block of each synapse type (NMDA's),
+
+        B(v) = 1 / (1 + mg_c exp(-mg_a v)),   mg_c = mg / mg_k,   mg_a = mg_slope,
+
+    which scales its current. ``mg = 0`` (the default) is no block: ``B = 1``.
+    """
+    mg = registry.table("mg", default=MG)
+    assert (mg >= 0).all(), "synapse params: mg must be >= 0"
+    return {
+        "mg_c": mg / registry.table("mg_k", default=MG_K),
+        "mg_a": registry.table("mg_slope", default=MG_SLOPE),
+    }
+
+
 def conductance_kernel(
     tau_rise: torch.Tensor, tau_decay: torch.Tensor, g_bar: torch.Tensor
 ) -> torch.Tensor:

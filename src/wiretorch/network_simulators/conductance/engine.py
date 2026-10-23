@@ -97,6 +97,8 @@ class _Launch:
     decay: torch.Tensor  # (2, SP)
     E_syn: torch.Tensor  # (SP,)
     g_clip: torch.Tensor  # (SP,)
+    mg_a: torch.Tensor  # (SP,): the Mg block's slope
+    mg_lc: torch.Tensor  # (SP,): log of its mg / mg_k (-inf: no block)
     p: Physiology
     sample: bool
     probabilities: bool
@@ -121,6 +123,11 @@ class _Launch:
     def refractory(self) -> bool:
         """Whether any neuron has a refractory period (the kernels' ``REFRACTORY``)."""
         return self.p.n_ref is not None
+
+    @property
+    def mg_block(self) -> bool:
+        """Whether any synapse type has a Mg block (the kernels' ``MG_BLOCK``)."""
+        return self.p.mg_c is not None
 
     def held(self) -> torch.Tensor:
         return held_buffer(self.B, self.T, self.N, self.refractory, self.dummy)
@@ -181,12 +188,15 @@ def _prepare(
             "g": torch.empty((Bt, T, N, 2, S), device=x.device),
         }
     n_ref, counter = refractory_tables(p.n_ref, refractory, dummy)
+    unused = torch.zeros_like(p.E_syn.detach())  # Mg block tables when there is none
     return _Launch(
         B=B, T=T, N=N, S=S, SP=SP,
         K_rec=len(drive.recurrent), K_ff=len(drive.feedforward),
         made=_pad(drive.made.float(), SP),
         jump=_pad(p.jump.detach(), SP), decay=_pad(p.decay.detach(), SP),
         E_syn=_pad(p.E_syn.detach(), SP), g_clip=_pad(p.g_clip, SP),
+        mg_a=_pad(p.mg_a if p.mg_c is not None else unused, SP),
+        mg_lc=_pad(torch.log(p.mg_c) if p.mg_c is not None else unused, SP),
         # The kernels get the physiology detached (the autograd functions take it as
         # inputs): launching with tensors that require grad costs host time per launch.
         p=replace(p, **{name: getattr(p, name).detach() for name in PHYSIOLOGY}),
@@ -216,7 +226,7 @@ def _scan(L, A, scale, v, g, spikes, prob, saved, t0=0):
     v_saved, G_saved, held = saved if saved else (L.dummy,) * 3
     TA = A.shape[2]
     kernels.scan_forward[(triton.cdiv(L.B * L.N, BLOCK),)](
-        A, scale, L.made, L.jump, L.decay, L.E_syn, L.g_clip,
+        A, scale, L.made, L.jump, L.decay, L.E_syn, L.g_clip, L.mg_a, L.mg_lc,
         *_neurons(L.p),
         v, g, spikes, L.dummy if prob is None else prob, L.noise, L.n_ref, L.counter,
         v_saved, G_saved, held, *_track_buffers(L),
@@ -224,6 +234,7 @@ def _scan(L, A, scale, v, g, spikes, prob, saved, t0=0):
         K=L.K, S=L.S, SP=L.SP, BLOCK=BLOCK,
         SAVE=bool(saved), TRACK=L.tracked is not None,
         PROB=prob is not None, SAMPLE=L.sample, REFRACTORY=L.refractory,
+        MG_BLOCK=L.mg_block,
     )  # fmt: skip
 
 
@@ -257,14 +268,14 @@ def _recurrent(L, A_ff_blocks, W, rows, sizes, scale, v, g, spikes, saved):
                 )  # fmt: skip
             kernels.recurrent_step[(L.B, triton.cdiv(L.N, STEP_BLOCK))](
                 A_ff, W, w_start, lists, counts, scale, L.made, L.jump, L.decay,
-                L.E_syn, L.g_clip, *_neurons(L.p),
+                L.E_syn, L.g_clip, L.mg_a, L.mg_lc, *_neurons(L.p),
                 v, g, spikes, L.noise, L.n_ref, L.counter,
                 v_saved, G_saved, A_saved, held, *_track_buffers(L),
                 dt, surr, L.track_b, t, i, L.T, T_ff, L.B, L.N, capacity,
                 K_REC=L.K_rec, K_FF=L.K_ff, S=L.S, SP=L.SP,
                 BLOCK=STEP_BLOCK, ROWS=GATHER_ROWS,
                 SAVE=bool(saved), TRACK=L.tracked is not None, SAMPLE=L.sample,
-                REFRACTORY=L.refractory,
+                REFRACTORY=L.refractory, MG_BLOCK=L.mg_block,
             )  # fmt: skip
 
 
@@ -279,11 +290,13 @@ def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
         grad_spikes.contiguous(),
         L.dummy if grad_prob is None else grad_prob.contiguous(),
         *saved, A, scale, L.made, L.jump, L.decay, L.E_syn, L.g_clip,
+        L.mg_a, L.mg_lc,
         L.p.theta, L.p.E_L, L.p.C_m, L.p.beta, grad_A, partial, *physiology,
         L.p.dt, L.p.surr_scale, L.B, L.T, L.N,
         K=L.K, KP=triton.next_power_of_2(L.K), S=L.S, SP=L.SP, BLOCK=block,
         WANT_A=want_A, WANT_SCALE=want_scale, **L.flags(),
         PROB=grad_prob is not None, SAMPLE=L.sample, REFRACTORY=L.refractory,
+        MG_BLOCK=L.mg_block,
     )  # fmt: skip
     return (
         grad_A if want_A else None,
@@ -318,10 +331,10 @@ def _recurrent_backward(L, saved, A, scale, W, rows, sizes, grad_spikes, want_sc
     for t in reversed(range(L.T)):
         kernels.inject_backward[grid](
             lv, lg, H, spikes, v_saved, G_saved, held, A, scale, L.made, L.jump,
-            L.decay, L.E_syn, L.g_clip, L.p.E_L, L.p.C_m, L.p.beta, grad_A, partial,
-            *rest, L.p.dt, t, L.B, L.T, L.N,
+            L.decay, L.E_syn, L.g_clip, L.mg_a, L.mg_lc, L.p.E_L, L.p.C_m, L.p.beta,
+            grad_A, partial, *rest, L.p.dt, t, L.B, L.T, L.N,
             K=L.K, S=L.S, SP=L.SP, BLOCK=block, WANT_SCALE=want_scale, **flags,
-            REFRACTORY=L.refractory,
+            REFRACTORY=L.refractory, MG_BLOCK=L.mg_block,
         )  # fmt: skip
         for k, (source, carry) in enumerate(blocks):
             R.index_copy_(1, source, carry(grad_A[k, :, t]))

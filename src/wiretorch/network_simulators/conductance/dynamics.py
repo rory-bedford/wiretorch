@@ -8,6 +8,7 @@ follow line for line. One step, for every neuron of every trial:
    Bernoulli escape noise in ``"sample"`` mode) and the neuron is not refractory.
 2. **Currents** from the conductances: each synapse type's rise + decay components,
    clipped to ``[0, g_clip]``, times the driving force ``v - E_syn``; plus the leak.
+   An NMDA-like synapse type scales its current by its voltage-dependent Mg block.
 3. **Integrate** the voltage with forward Euler, and reset the neurons that spiked; a
    neuron stays at reset for the ``n_ref`` steps after its spike (its refractory
    period), and a counter per neuron (``refractory``, part of the state) tracks them.
@@ -49,6 +50,8 @@ class Physiology:
     decay components.
     ``n_ref`` ``(N,)`` int32 is each neuron's refractory period in steps, or None if no
     neuron has one.
+    ``mg_c``, ``mg_a`` ``(S,)`` are each synapse type's Mg block (see
+    ``synapses.mg_block_tables``), or None if no synapse type has one.
     """
 
     theta: torch.Tensor
@@ -67,6 +70,8 @@ class Physiology:
     #: in float32 regardless); the PyTorch reference ignores it.
     storage_dtype: torch.dtype = torch.float32
     n_ref: torch.Tensor | None = None
+    mg_c: torch.Tensor | None = None
+    mg_a: torch.Tensor | None = None
 
 
 def jumps(drive: Drive, jump: torch.Tensor) -> list[torch.Tensor]:
@@ -84,10 +89,18 @@ def spike(v: torch.Tensor, p: Physiology, held=None) -> torch.Tensor:
     return s if held is None else s * (1 - held)
 
 
+def mg_block(v, mg_c, mg_a):
+    """``(B, N, S)``: ``1 / (1 + mg_c exp(-mg_a v))``, written as a sigmoid so it stays
+    finite at any voltage; ``mg_c = 0`` (no block) gives exactly 1."""
+    return torch.sigmoid(mg_a * v[:, :, None] - torch.log(mg_c))
+
+
 def membrane(v, s, g, p: Physiology):
     """Currents and the voltage after the step, reset where ``s`` (a spike, or the
     refractory period: see ``held_at_reset``). Returns ``(v_next, I, I_leak)``."""
     g_total = torch.minimum(g.sum(dim=2).clamp(min=0.0), p.g_clip)
+    if p.mg_c is not None:  # the Mg block: B(v) = 1 / (1 + mg_c exp(-mg_a v))
+        g_total = g_total * mg_block(v, p.mg_c, p.mg_a)
     I = g_total * (v[:, :, None] - p.E_syn)
     I_leak = (v - p.E_L) * (1 - p.beta) * p.C_m / p.dt
     s = s.detach()

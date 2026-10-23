@@ -110,6 +110,13 @@ SF_SPREAD = 0.15  # log-normal spread of the perturbed scaling factors
 RATE_HZ = {"mitral": 10.0, "excitatory": 8.0, "inhibitory": 25.0}
 
 
+def mg_block(synapses, mg):
+    """``synapses`` with a Mg block of ``mg`` mM on the NMDA types (unchanged if None)."""
+    if mg is None:
+        return synapses
+    return [{**s, "mg": mg} if s["name"] == "NMDA" else s for s in synapses]
+
+
 def refractory(cells, tau_ref):
     """``cells`` with a refractory period of ``tau_ref`` ms (unchanged if None)."""
     return cells if tau_ref is None else [{**c, "tau_ref": tau_ref} for c in cells]
@@ -239,11 +246,12 @@ def recurrent(
     learn=None,
     learnt_weights=False,
     tau_ref=None,
+    mg=None,
 ):
     """``ConductanceLIFNetwork`` with frozen weights or perturbed scaling factors, and
     the physiology ``learn`` names; ``learnt_weights`` makes the recurrent weights
     full-rank parameters (and the feedforward ones scaling factors), ``tau_ref`` (ms)
-    gives every cell type a refractory period."""
+    gives every cell type a refractory period, ``mg`` (mM) the NMDA types a Mg block."""
     rng, types, w_rec, w_ff = _structure(seed, n, n_ff)
     ff_types = np.zeros(n_ff, dtype=np.int64)
     if learnt_weights:
@@ -284,8 +292,8 @@ def recurrent(
         cell_type_indices_FF=ff_types,
         cell_params=refractory(CELLS, tau_ref),
         cell_params_FF=MITRAL_CELLS,
-        synapse_params=SYNAPSES,
-        synapse_params_FF=MITRAL_SYNAPSES,
+        synapse_params=mg_block(SYNAPSES, mg),
+        synapse_params_FF=mg_block(MITRAL_SYNAPSES, mg),
         surrgrad_scale=5.0,
         batch_size=batch_size,
         learn=learn,
@@ -313,16 +321,19 @@ def feedforward(
     input_seed=0,
     learn=None,
     tau_ref=None,
+    mg=None,
 ):
     """``FeedforwardConductanceLIFNetwork`` whose input rows are the external inputs and a
     ``recurrent`` network's neurons (as in teacher forcing), learning the physiology
-    ``learn`` names, with a refractory period of ``tau_ref`` ms if given.
+    ``learn`` names, with a refractory period of ``tau_ref`` ms and a Mg block of ``mg``
+    mM on the NMDA types if given.
 
     Scaling factors on every pathway, or (``learnt_weights``) full-rank mitral, low-rank
     excitatory and scaling-factor inhibitory pathways — one of each caching mode.
     """
     rng, types, w_rec, w_ff = _structure(seed, n, n_ff)
     cells, synapses = combined_physiology()
+    synapses = mg_block(synapses, mg)
     names = [c["name"] for c in cells]
     # Rows: [external inputs, recurrent neurons]; their types shift past "mitral".
     row_types = np.concatenate([np.zeros(n_ff, dtype=np.int64), types + 1])

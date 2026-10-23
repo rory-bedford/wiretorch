@@ -14,6 +14,7 @@ from wiretorch.network_simulators.conductance import engine
 from wiretorch.network_simulators.conductance.dynamics import Physiology
 from wiretorch.network_simulators.conductance.synapses import (
     conductance_kernel,
+    mg_block_tables,
     neuron_tables,
     synapse_tables,
 )
@@ -129,6 +130,10 @@ class ConductanceNetwork(ProjectionNetwork):
             self.register_buffer(name, table)
         for name, table in synapse_tables(self.registry).items():
             self.register_buffer(name, table)
+        # Not saved with the module (older checkpoints have no block): from the params.
+        for name, table in mg_block_tables(self.registry).items():
+            self.register_buffer(name, table, persistent=False)
+        self._mg_block = bool(self.mg_c.any())
         self._register_refractory()
         self.register_buffer(
             "surrgrad_scale", torch.tensor(self._surrgrad_scale, dtype=torch.float32)
@@ -194,6 +199,8 @@ class ConductanceNetwork(ProjectionNetwork):
             spike_mode=self.spike_mode,
             storage_dtype=self.storage_dtype,
             n_ref=self.n_ref if self._refractory else None,
+            mg_c=self.mg_c if self._mg_block else None,
+            mg_a=self.mg_a if self._mg_block else None,
         )
 
     def _initial_state(self) -> tuple[torch.Tensor, torch.Tensor]:

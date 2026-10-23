@@ -33,7 +33,7 @@ listed in `synapse_params` (recurrent) and `synapse_params_FF` (inputs):
 ```python
 synapse_params = [
     dict(name="AMPA", synapse_id=0, cell_id=0, tau_rise=0.1, tau_decay=5.0, E_syn=0.0, g_bar=4.0),
-    dict(name="NMDA", synapse_id=1, cell_id=0, tau_rise=10.0, tau_decay=60.0, E_syn=0.0, g_bar=0.5),
+    dict(name="NMDA", synapse_id=1, cell_id=0, tau_rise=10.0, tau_decay=60.0, E_syn=0.0, g_bar=0.5, mg=1.0),
     dict(name="GABA_A", synapse_id=2, cell_id=1, tau_rise=0.5, tau_decay=6.0, E_syn=-70.0, g_bar=8.0),
 ]
 ```
@@ -45,7 +45,7 @@ connection's weight drives every synapse type its source makes.
 
 | Neuron model | Synapse parameters |
 |---|---|
-| Conductance-based | `tau_rise`, `tau_decay`, `E_syn`, `g_bar`, optional `g_clip` (a cap on the conductance) |
+| Conductance-based | `tau_rise`, `tau_decay`, `E_syn`, `g_bar`, optional `g_clip` (a cap on the conductance) and `mg`, `mg_slope`, `mg_k` (a voltage-dependent Mg²⁺ block, for NMDA) |
 | Current-based | `tau_syn` (0: no memory), `type` (`"excitatory"` or `"inhibitory"`) |
 | Rate | `tau_syn` (0: no memory), `type` |
 
@@ -54,6 +54,10 @@ forward-Euler step, and if the total conductance is much larger than the membran
 capacitance per time step, the step overshoots and the network fires at several hundred
 Hz. Capping each synapse type's conductance, for example at 10 times its `g_bar`, keeps
 the step stable.
+
+An NMDA synapse type gets its voltage dependence from `mg`, the extracellular
+[Mg²⁺] in mM (1.0 is physiological; the default, 0, means no block). See
+{doc}`neuron-models`.
 
 ## Dale's law
 

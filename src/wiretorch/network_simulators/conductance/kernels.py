@@ -26,13 +26,18 @@ Layouts (all contiguous float32 unless noted):
         ``REFRACTORY`` which neurons were refractory (B, T, N) int8
     per-pathway tables: scale (K, N), made (K, SP)
     per-synapse tables, padded with zeros to SP, the next power of two > S:
-        jump (2, SP), decay (2, SP), E_syn (SP), g_clip (SP)
+        jump (2, SP), decay (2, SP), E_syn (SP), g_clip (SP), mg_a (SP), mg_lc (SP)
 
 ``g``, the saved ``G`` and the recurrent weights ``W`` may instead be float16 (the
 network's ``storage_dtype``): loads convert them to float32, stores round back.
 
 ``K`` pathways (one per source cell type and input side), ``S`` synapse types. A padded
 synapse column has zero jump, decay and clip, so it stays at zero and adds no current.
+
+A synapse type with a voltage-dependent Mg block (NMDA) scales its current by
+``B(v) = sigmoid(mg_a v - mg_lc)`` (``mg_lc = log(mg / mg_k)``, -inf for none); with
+``MG_BLOCK`` (some synapse type has one) ``_membrane`` applies it and
+``_membrane_adjoint`` its derivative, from the saved voltage, so nothing more is saved.
 
 Learnt physiology gets its gradient from the backward kernels too, each term compiled in
 only when it is learnt: per neuron ``theta``, ``U_reset``, ``E_L``, ``C_m`` and ``beta``,
@@ -59,10 +64,22 @@ from wiretorch.network_simulators.kernels import (  # noqa: F401 - re-exported
 
 
 @triton.jit
-def _membrane(v, s, gr, gd, U_reset, E_L, C_m, beta, E_syn, g_clip, dt):
+def _mg_block(v, mg_a, mg_lc):
+    """``(BLOCK, SP)``: each synapse type's Mg block at ``v``, ``1 / (1 + c exp(-a v))``
+    as ``sigmoid(a v - log c)`` (``mg_lc = log c``; -inf for no block, giving 1)."""
+    return tl.sigmoid(mg_a[None, :] * v[:, None] - mg_lc[None, :])
+
+
+@triton.jit
+def _membrane(
+    v, s, gr, gd, U_reset, E_L, C_m, beta, E_syn, g_clip, mg_a, mg_lc, dt,
+    MG_BLOCK: tl.constexpr,
+):  # fmt: skip
     """Synaptic and leak currents, and the voltage after the step (with reset)."""
     G = gr + gd
     Gc = tl.minimum(tl.maximum(G, 0.0), g_clip[None, :])
+    if MG_BLOCK:
+        Gc = Gc * _mg_block(v, mg_a, mg_lc)
     I = Gc * (v[:, None] - E_syn[None, :])
     I_leak = (v - E_L) * (1 - beta) * C_m / dt
     v_next = (v - (tl.sum(I, axis=1) + I_leak) * dt / C_m) * (1 - s) + U_reset * s
@@ -94,14 +111,14 @@ def _track(
 
 @triton.jit
 def scan_forward(
-    A, scale, made, jump, decay, E_syn, g_clip,
+    A, scale, made, jump, decay, E_syn, g_clip, mg_a, mg_lc,
     theta, U_reset, E_L, C_m, beta,
     v_state, g_state, spikes, prob, noise, n_ref, counter,
     v_saved, G_saved, held_saved, track_v, track_I, track_g,
     dt_ptr, surr_ptr, track_b, t0, TA, B, T, N,
     K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
     SAVE: tl.constexpr, TRACK: tl.constexpr, PROB: tl.constexpr, SAMPLE: tl.constexpr,
-    REFRACTORY: tl.constexpr,
+    REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
     """Integrate steps ``t0 .. t0 + TA`` of a ``T``-step chunk.
 
@@ -127,6 +144,7 @@ def scan_forward(
     beta_n = tl.load(beta + n, mask=live)
     E = tl.load(E_syn + j)
     clip = tl.load(g_clip + j)
+    mga, mglc = tl.load(mg_a + j), tl.load(mg_lc + j)
     jump_r, jump_d = tl.load(jump + j), tl.load(jump + SP + j)
     decay_r, decay_d = tl.load(decay + j), tl.load(decay + SP + j)
 
@@ -156,7 +174,20 @@ def scan_forward(
                 p = p * (1 - held)
             tl.store(prob + out, p, mask=live)
         G, I, I_leak, v_next = _membrane(
-            v, r, gr, gd, U_reset_n, E_L_n, C_m_n, beta_n, E, clip, dt
+            v,
+            r,
+            gr,
+            gd,
+            U_reset_n,
+            E_L_n,
+            C_m_n,
+            beta_n,
+            E,
+            clip,
+            mga,
+            mglc,
+            dt,
+            MG_BLOCK,
         )
         if SAVE:
             tl.store(v_saved + out, v, mask=live)
@@ -212,10 +243,10 @@ def _injection(A, scale, made, stride, out, n, j, live, N, K: tl.constexpr,
 
 @triton.jit
 def _membrane_adjoint(
-    dv, s, v, G, E, clip, E_L, C_m, beta, dt,
+    dv, s, v, G, E, clip, mg_a, mg_lc, E_L, C_m, beta, dt,
     acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E,
     WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr, WANT_BETA: tl.constexpr,
-    WANT_C_M: tl.constexpr, WANT_E_SYN: tl.constexpr,
+    WANT_C_M: tl.constexpr, WANT_E_SYN: tl.constexpr, MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
     """Step ``dv`` (dL/dv after the step) back through the membrane update
     ``v_next = (v - (sum_j I_j + I_leak) dt / C) (1 - s) + U s``.
@@ -228,6 +259,14 @@ def _membrane_adjoint(
     gy = -gx * dt / C_m
     clamp = tl.where(G < clip[None, :], 1.0, tl.where(G == clip[None, :], 0.5, 0.0))
     clamp = tl.where(G >= 0.0, clamp, 0.0)
+    # dI_j/dv: Gc_j without a block; with one (I_j = Gc_j B_j (v - E_j)), also the
+    # block's own slope, B_j' = a_j B_j (1 - B_j).
+    slope = Gc
+    if MG_BLOCK:
+        Bm = _mg_block(v, mg_a, mg_lc)
+        slope = Gc * Bm + Gc * (v[:, None] - E[None, :]) * mg_a[None, :] * Bm * (1 - Bm)
+        clamp = clamp * Bm
+        Gc = Gc * Bm  # from here on, the blocked conductance
     dG = gy[:, None] * (v[:, None] - E[None, :]) * clamp
     if WANT_RESET:
         acc_reset += dv * s
@@ -240,14 +279,15 @@ def _membrane_adjoint(
         acc_C_m -= gy * I_syn / C_m
     if WANT_E_SYN:
         acc_E -= gy[:, None] * Gc
-    dv = gx + gy * (tl.sum(Gc, axis=1) + (1 - beta) * C_m / dt)
+    dv = gx + gy * (tl.sum(slope, axis=1) + (1 - beta) * C_m / dt)
     return dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E
 
 
 @triton.jit
 def scan_backward(
     grad_spikes, grad_prob, spikes, v_saved, G_saved, g_init, held_saved, A, scale,
-    made, jump, decay, E_syn, g_clip, theta, E_L, C_m, beta, grad_A, grad_scale,
+    made, jump, decay, E_syn, g_clip, mg_a, mg_lc, theta, E_L, C_m, beta, grad_A,
+    grad_scale,
     grad_theta, grad_reset, grad_E_L, grad_C_m, grad_beta, grad_E_syn, grad_decay,
     grad_jump, dt_ptr, surr_ptr, B, T, N,
     K: tl.constexpr, KP: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
@@ -256,6 +296,7 @@ def scan_backward(
     WANT_C_M: tl.constexpr, WANT_BETA: tl.constexpr, WANT_E_SYN: tl.constexpr,
     WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr,
     PROB: tl.constexpr, SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
+    MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
     """Backpropagate through ``T`` steps: the adjoint of ``scan_forward``.
 
@@ -283,6 +324,7 @@ def scan_backward(
     beta_n = tl.load(beta + n, mask=live)
     E = tl.load(E_syn + j)
     clip = tl.load(g_clip + j)
+    mga, mglc = tl.load(mg_a + j), tl.load(mg_lc + j)
     jump_r, jump_d = tl.load(jump + j), tl.load(jump + SP + j)
     decay_r, decay_d = tl.load(decay + j), tl.load(decay + SP + j)
 
@@ -344,9 +386,9 @@ def scan_backward(
                 acc += tl.where(kk[None, :] == k, (q * a)[:, None], 0.0)
 
         dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E = _membrane_adjoint(
-            dv, r, v, G, E, clip, E_L_n, C_m_n, beta_n, dt,
+            dv, r, v, G, E, clip, mga, mglc, E_L_n, C_m_n, beta_n, dt,
             acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E,
-            WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN,
+            WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN, MG_BLOCK,
         )  # fmt: skip
 
         # Spike (surrogate) and probability outputs of step t, both of v - theta.
@@ -398,13 +440,13 @@ def scan_backward(
 @triton.jit
 def recurrent_step(
     A_ff, W, w_start, lists, counts, scale, made, jump, decay, E_syn, g_clip,
-    theta, U_reset, E_L, C_m, beta,
+    mg_a, mg_lc, theta, U_reset, E_L, C_m, beta,
     v_state, g_state, spikes, noise, n_ref, counter,
     v_saved, G_saved, A_saved, held_saved, track_v, track_I, track_g,
     dt_ptr, surr_ptr, track_b, t, t_ff, T, T_ff, B, N, L,
     K_REC: tl.constexpr, K_FF: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, ROWS: tl.constexpr, SAVE: tl.constexpr, TRACK: tl.constexpr,
-    SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
+    SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
     """Advance a recurrent network one step, for one trial and a block of neurons.
 
@@ -424,6 +466,7 @@ def recurrent_step(
     theta_n = tl.load(theta + n, mask=live)
     E = tl.load(E_syn + j)
     clip = tl.load(g_clip + j)
+    mga, mglc = tl.load(mg_a + j), tl.load(mg_lc + j)
 
     v = tl.load(v_state + idx, mask=live)
     g_row = g_state + (b * (2 * S * N) + n)[:, None] + j[None, :] * N
@@ -449,7 +492,7 @@ def recurrent_step(
         tl.load(E_L + n, mask=live),
         tl.load(C_m + n, mask=live, other=1.0),
         tl.load(beta + n, mask=live),
-        E, clip, dt,
+        E, clip, mga, mglc, dt, MG_BLOCK,
     )  # fmt: skip
     if SAVE:
         tl.store(v_saved + out, v, mask=live)
@@ -502,12 +545,14 @@ def recurrent_step(
 @triton.jit
 def inject_backward(
     lv, lg, H_state, spikes, v_saved, G_saved, held_saved, A, scale, made, jump, decay,
-    E_syn, g_clip, E_L, C_m, beta, grad_A, grad_scale, grad_reset, grad_E_L, grad_C_m,
+    E_syn, g_clip, mg_a, mg_lc, E_L, C_m, beta, grad_A, grad_scale, grad_reset,
+    grad_E_L, grad_C_m,
     grad_beta, grad_E_syn, grad_decay, grad_jump, dt_ptr, t, B, T, N,
     K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
     WANT_SCALE: tl.constexpr, WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr,
     WANT_C_M: tl.constexpr, WANT_BETA: tl.constexpr, WANT_E_SYN: tl.constexpr,
     WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr, REFRACTORY: tl.constexpr,
+    MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
     """Step the adjoint back through the integration and injection of step ``t``.
 
@@ -530,6 +575,7 @@ def inject_backward(
 
     E = tl.load(E_syn + j)
     clip = tl.load(g_clip + j)
+    mga, mglc = tl.load(mg_a + j), tl.load(mg_lc + j)
     jump_r, jump_d = tl.load(jump + j), tl.load(jump + SP + j)
     decay_r, decay_d = tl.load(decay + j), tl.load(decay + SP + j)
 
@@ -571,11 +617,11 @@ def inject_backward(
 
     zero = tl.zeros((BLOCK,), dtype=tl.float32)
     dv, dG, g_reset, g_E_L, g_beta, g_C_m, g_E = _membrane_adjoint(
-        dv, s, v, G, E, clip,
+        dv, s, v, G, E, clip, mga, mglc,
         tl.load(E_L + n, mask=live), tl.load(C_m + n, mask=live, other=1.0),
         tl.load(beta + n, mask=live), dt,
         zero, zero, zero, zero, tl.zeros((BLOCK, SP), dtype=tl.float32),
-        WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN,
+        WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN, MG_BLOCK,
     )  # fmt: skip
     if WANT_RESET:
         _accumulate(grad_reset + idx, g_reset, live)

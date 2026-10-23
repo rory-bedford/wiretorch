@@ -45,7 +45,8 @@ class _SynapticLayerConfig(Config):
         """One dict per synapse type, numbered across cell types in config order.
 
         Keys: 'name', 'synapse_id', 'cell_id', 'tau_rise', 'tau_decay', 'E_syn',
-        'g_bar', and 'g_clip' if the cell type sets clipping.
+        'g_bar', and 'g_clip' if the cell type sets clipping, likewise 'mg', 'mg_slope',
+        'mg_k' (the Mg block).
         """
         cell_ids = {name: i for i, name in enumerate(self.cell_types.names)}
         synapse_params = []
@@ -62,6 +63,10 @@ class _SynapticLayerConfig(Config):
                 }
                 if synapse.g_clip is not None:
                     params["g_clip"] = synapse.g_clip[i]
+                for key in ("mg", "mg_slope", "mg_k"):
+                    values = getattr(synapse, f"{key}_list")
+                    if values is not None:
+                        params[key] = values[i]
                 synapse_params.append(params)
         return synapse_params
 
