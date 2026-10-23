@@ -58,6 +58,7 @@ conductances entering the chunk (``g_init``) kept.
 
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from wiretorch.network_simulators.kernels import (  # noqa: F401 - re-exported
     _accumulate,
@@ -82,15 +83,28 @@ def _membrane(
     v, s, gr, gd, U_reset, E_L, C_m, beta, E_syn, g_clip, mg_a, mg_lc, dt,
     MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
-    """Synaptic and leak currents, and the voltage after the step (with reset)."""
+    """Synaptic and leak currents, and the voltage after the step (with reset): the
+    exponential-Euler step of ``dynamics.membrane``."""
     G = gr + gd
     Gc = tl.minimum(tl.maximum(G, 0.0), g_clip[None, :])
     if MG_BLOCK:
         Gc = Gc * _mg_block(v, mg_a, mg_lc)
     I = Gc * (v[:, None] - E_syn[None, :])
-    I_leak = (v - E_L) * (1 - beta) * C_m / dt
-    v_next = (v - (tl.sum(I, axis=1) + I_leak) * dt / C_m) * (1 - s) + U_reset * s
+    g_L, _, phi = _relaxation(tl.sum(Gc, axis=1), C_m, beta, dt)
+    I_leak = g_L * (v - E_L)
+    v_next = (v - phi * (tl.sum(I, axis=1) + I_leak)) * (1 - s) + U_reset * s
     return G, I, I_leak, v_next
+
+
+@triton.jit
+def _relaxation(S, C_m, beta, dt):
+    """``g_L``, and the factor ``a = exp(-dt (g_L + S) / C_m)`` by which ``v`` relaxes
+    over the step and ``phi = (1 - a) / (g_L + S)``, ``S`` the summed conductances:
+    precisely (``log1p``, ``expm1``), as ``beta`` and ``a`` are close to 1."""
+    rate = -libdevice.log1p(beta - 1) / dt  # 1 / tau_mem
+    g_L = C_m * rate
+    x = dt * rate + dt * S / C_m
+    return g_L, tl.exp(-x), -libdevice.expm1(-x) / (g_L + S)
 
 
 @triton.jit
@@ -148,7 +162,7 @@ def scan_forward(
     U_reset_n = tl.load(U_reset + n, mask=live)
     E_L_n = tl.load(E_L + n, mask=live)
     C_m_n = tl.load(C_m + n, mask=live, other=1.0)
-    beta_n = tl.load(beta + n, mask=live)
+    beta_n = tl.load(beta + n, mask=live, other=0.5)
     E = tl.load(E_syn + j)
     clip = tl.load(g_clip + j)
     mga, mglc = tl.load(mg_a + j), tl.load(mg_lc + j)
@@ -256,38 +270,53 @@ def _membrane_adjoint(
     WANT_C_M: tl.constexpr, WANT_E_SYN: tl.constexpr, MG_BLOCK: tl.constexpr,
 ):  # fmt: skip
     """Step ``dv`` (dL/dv after the step) back through the membrane update
-    ``v_next = (v - (sum_j I_j + I_leak) dt / C) (1 - s) + U s``.
+    ``v_next = (v - phi J) (1 - s) + U s`` of ``_membrane``: ``J = I_leak + sum_j I_j``,
+    ``phi = (1 - a) / g_tot``, ``a = beta exp(-dt S / C)``, ``g_tot = g_L + S``,
+    ``S = sum_j G_j`` (the conductances, clipped and blocked), ``g_L = -C log(beta) / dt``.
 
     Returns dL/dv entering the step (without its spike term), dL/dG of the summed
     conductances it read, and the accumulators with this step's terms added.
     """
     Gc = tl.minimum(tl.maximum(G, 0.0), clip[None, :])
     gx = dv * (1 - s)
-    gy = -gx * dt / C_m
     clamp = tl.where(G < clip[None, :], 1.0, tl.where(G == clip[None, :], 0.5, 0.0))
     clamp = tl.where(G >= 0.0, clamp, 0.0)
-    # dI_j/dv: Gc_j without a block; with one (I_j = Gc_j B_j (v - E_j)), also the
-    # block's own slope, B_j' = a_j B_j (1 - B_j).
-    slope = Gc
     if MG_BLOCK:
         Bm = _mg_block(v, mg_a, mg_lc)
-        slope = Gc * Bm + Gc * (v[:, None] - E[None, :]) * mg_a[None, :] * Bm * (1 - Bm)
-        clamp = clamp * Bm
-        Gc = Gc * Bm  # from here on, the blocked conductance
-    dG = gy[:, None] * (v[:, None] - E[None, :]) * clamp
+        G_eff = Gc * Bm
+    else:
+        G_eff = Gc
+    drive = v[:, None] - E[None, :]
+    S = tl.sum(G_eff, axis=1)
+    g_L, a, phi = _relaxation(S, C_m, beta, dt)
+    g_tot = g_L + S
+    J = g_L * (v - E_L) + tl.sum(G_eff * drive, axis=1)
+    # dL/dG_j of each (blocked) conductance: through J, and through phi (via S).
+    phi_S = (a * dt / C_m - phi) / g_tot
+    dG_eff = -gx[:, None] * (phi_S[:, None] * J[:, None] + phi[:, None] * drive)
+    # dv/dv is a with the conductances held; a block adds dG_j/dv = Gc_j B_j'.
+    dv_in = gx * a
+    if MG_BLOCK:
+        dv_in += tl.sum(dG_eff * Gc * mg_a[None, :] * Bm * (1 - Bm), axis=1)
+        dG = dG_eff * Bm * clamp
+    else:
+        dG = dG_eff * clamp
     if WANT_RESET:
         acc_reset += dv * s
     if WANT_E_L:
-        acc_E_L += gx * (1 - beta)
-    if WANT_BETA:
-        acc_beta += gx * (v - E_L)
-    if WANT_C_M:  # d/dC_m of -(sum_j I_j) dt / C_m
-        I_syn = tl.sum(Gc * (v[:, None] - E[None, :]), axis=1)
-        acc_C_m -= gy * I_syn / C_m
+        acc_E_L += gx * phi * g_L
+    if WANT_C_M or WANT_BETA:
+        g_v = v - E_L
+    if WANT_C_M:  # g_L = -C log(beta) / dt and a both depend on C
+        dphi = -(a * dt * S / (C_m * C_m)) / g_tot - phi * (g_L / C_m) / g_tot
+        acc_C_m -= gx * (dphi * J + phi * g_v * g_L / C_m)
+    if WANT_BETA:  # and on beta
+        dg_L = -C_m / (beta * dt)
+        dphi = -(a / beta) / g_tot - phi * dg_L / g_tot
+        acc_beta -= gx * (dphi * J + phi * g_v * dg_L)
     if WANT_E_SYN:
-        acc_E -= gy[:, None] * Gc
-    dv = gx + gy * (tl.sum(slope, axis=1) + (1 - beta) * C_m / dt)
-    return dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E
+        acc_E += gx[:, None] * phi[:, None] * G_eff
+    return dv_in, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E
 
 
 @triton.jit
@@ -328,7 +357,7 @@ def scan_backward(
     theta_n = tl.load(theta + n, mask=live)
     E_L_n = tl.load(E_L + n, mask=live)
     C_m_n = tl.load(C_m + n, mask=live, other=1.0)
-    beta_n = tl.load(beta + n, mask=live)
+    beta_n = tl.load(beta + n, mask=live, other=0.5)
     E = tl.load(E_syn + j)
     clip = tl.load(g_clip + j)
     mga, mglc = tl.load(mg_a + j), tl.load(mg_lc + j)
@@ -501,7 +530,7 @@ def recurrent_step(
         tl.load(U_reset + n, mask=live),
         tl.load(E_L + n, mask=live),
         tl.load(C_m + n, mask=live, other=1.0),
-        tl.load(beta + n, mask=live),
+        tl.load(beta + n, mask=live, other=0.5),
         E, clip, mga, mglc, dt, MG_BLOCK,
     )  # fmt: skip
     if SAVE:
@@ -634,7 +663,7 @@ def inject_backward(
     dv, dG, g_reset, g_E_L, g_beta, g_C_m, g_E = _membrane_adjoint(
         dv, s, v, G, E, clip, mga, mglc,
         tl.load(E_L + n, mask=live), tl.load(C_m + n, mask=live, other=1.0),
-        tl.load(beta + n, mask=live), dt,
+        tl.load(beta + n, mask=live, other=0.5), dt,
         zero, zero, zero, zero, tl.zeros((BLOCK, SP), dtype=tl.float32),
         WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN, MG_BLOCK,
     )  # fmt: skip

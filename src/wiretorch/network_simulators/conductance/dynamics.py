@@ -9,7 +9,9 @@ follow line for line. One step, for every neuron of every trial:
 2. **Currents** from the conductances: each synapse type's rise + decay components,
    clipped to ``[0, g_clip]``, times the driving force ``v - E_syn``; plus the leak.
    An NMDA-like synapse type scales its current by its voltage-dependent Mg block.
-3. **Integrate** the voltage with forward Euler, and reset the neurons that spiked; a
+3. **Integrate** the voltage with exponential Euler — exact for the conductances held
+   over the step, so stable however large they are — and reset the neurons that
+   spiked; a
    neuron stays at reset for the ``n_ref`` steps after its spike (its refractory
    period), and a counter per neuron (``refractory``, part of the state) tracks them.
 4. **Decay** each conductance component, then **inject** this step's input: every
@@ -103,14 +105,26 @@ def mg_block(v, mg_c, mg_a):
 
 def membrane(v, s, g, p: Physiology):
     """Currents and the voltage after the step, reset where ``s`` (a spike, or the
-    refractory period: see ``held_at_reset``). Returns ``(v_next, I, I_leak)``."""
+    refractory period: see ``held_at_reset``). Returns ``(v_next, I, I_leak)``.
+
+    With the conductances held over the step, ``C_m dv/dt = -g_tot (v - V_inf)`` is
+    linear: ``v`` relaxes towards ``V_inf`` by the factor ``a = exp(-dt g_tot / C_m)``,
+    i.e. ``v_next = v - (1 - a) / g_tot (I_leak + sum_j I_j)`` — never past ``V_inf``.
+    ``g_L = C_m / tau_mem``, written ``-C_m log(beta) / dt`` (``beta`` is the leak's
+    decay, so ``a = beta exp(-dt sum_j G_j / C_m)``).
+    """
     g_total = torch.minimum(g.sum(dim=2).clamp(min=0.0), p.g_clip)
     if p.mg_c is not None:  # the Mg block: B(v) = 1 / (1 + mg_c exp(-mg_a v))
         g_total = g_total * mg_block(v, p.mg_c, p.mg_a)
     I = g_total * (v[:, :, None] - p.E_syn)
-    I_leak = (v - p.E_L) * (1 - p.beta) * p.C_m / p.dt
+    rate = -torch.log1p(p.beta - 1) / p.dt  # 1 / tau_mem
+    g_L = p.C_m * rate
+    I_leak = g_L * (v - p.E_L)
+    G = g_total.sum(dim=2)
+    x = p.dt * rate + p.dt * G / p.C_m  # dt g_tot / C_m
+    step = -torch.expm1(-x) / (g_L + G)  # (1 - a) / g_tot, precisely
     s = s.detach()
-    v_next = (v - (I.sum(dim=2) + I_leak) * p.dt / p.C_m) * (1 - s) + p.U_reset * s
+    v_next = (v - step * (I.sum(dim=2) + I_leak)) * (1 - s) + p.U_reset * s
     return v_next, I, I_leak
 
 

@@ -4,6 +4,12 @@ The release notes of each version on GitHub are taken from its section here.
 
 ## [Unreleased]
 
+- **Breaking (numerics):** the conductance-based voltage takes an exponential-Euler step
+  instead of a forward-Euler one, exact for the conductances held over the step and
+  stable however large they are, so `g_clip` is no longer needed for stability. Spike
+  trains differ slightly from earlier versions. The tracked leak current is now
+  `g_L (v - E_L)`.
+
 - Removed the former name `connectome_snns` (the import alias, `CONNECTOME_SNNS_BACKEND`,
   and reading `connectome_snns_commit` from old experiment metadata): use `wiretorch`.
 - `recurrent_gradients` on `ConductanceLIFNetwork` and `CurrentLIFNetwork`: whether

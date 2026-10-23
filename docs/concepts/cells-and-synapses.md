@@ -49,11 +49,9 @@ connection's weight drives every synapse type its source makes.
 | Current-based | `tau_syn` (0: no memory), `type` (`"excitatory"` or `"inhibitory"`) |
 | Rate | `tau_syn` (0: no memory), `type` |
 
-We recommend setting `g_clip` for conductance-based synapses. The voltage takes a
-forward-Euler step, and if the total conductance is much larger than the membrane
-capacitance per time step, the step overshoots and the network fires at several hundred
-Hz. Capping each synapse type's conductance, for example at 10 times its `g_bar`, keeps
-the step stable.
+`g_clip` is not needed for numerical stability: the voltage step is exact for the
+conductances of the step, however large ({doc}`neuron-models`). It remains an optional
+cap on a synapse type's conductance.
 
 An NMDA synapse type gets its voltage dependence from `mg`, the extracellular
 [Mg²⁺] in mM (1.0 is physiological; the default, 0, means no block), and its

@@ -31,11 +31,16 @@ cannot be learnt.
 When $v$ crosses $\theta$ the neuron spikes and $v$ is reset to
 $U_\text{reset}$. An input spike increases the conductance of each synapse type its
 source makes by the weight times the peak conductance $\bar g$ (the difference of
-exponentials is normalised to peak at $\bar g$). In each step the leak and the
-conductances decay exactly, and the synaptic currents take a forward-Euler step.
+exponentials is normalised to peak at $\bar g$). In each step the conductances decay
+exactly, and the voltage takes an exponential-Euler step: with the conductances held
+over the step the equation is linear, $C_m \dot v = -g_\text{tot} (v - V_\infty)$, and
+$v$ relaxes towards $V_\infty$ by the factor $e^{-\Delta t\, g_\text{tot} / C_m}$. The step
+is stable however large the conductances: $v$ never overshoots $V_\infty$, which lies
+between the reversal potentials.
 
-`g_clip` caps a synapse type's conductance (hard clipping). Saturation, below, is the
-dynamical alternative: it limits how much of a source's receptors its spikes can open.
+`g_clip` optionally caps a synapse type's conductance (hard clipping). Saturation,
+below, is the dynamical alternative: it limits how much of a source's receptors its
+spikes can open.
 
 ### Receptor saturation
 
