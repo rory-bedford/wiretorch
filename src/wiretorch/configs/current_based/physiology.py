@@ -16,3 +16,4 @@ class PhysiologyConfig(Config):
     U_rest: float  # Resting membrane potential (mV)
     theta: float  # Spike threshold voltage (mV)
     U_reset: float  # Reset voltage after spike (mV)
+    tau_ref: float = 0.0  # Refractory period (ms): held at U_reset, no spikes

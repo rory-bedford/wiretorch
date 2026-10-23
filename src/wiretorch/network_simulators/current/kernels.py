@@ -18,8 +18,10 @@ so that a neuron's state never leaves registers within a chunk:
 Layouts (all contiguous float32 unless noted):
 
     v (B, N)    I (B, S, N) — the networks expose it as a (B, N, S) view
+    refractory counters (B, N) int32, periods n_ref (N,) int32 (``REFRACTORY`` only)
     drive A (K, B, T, N)    spikes (B, T, N)
-    saved for backward: v (B, T, N); recurrent activations A (K_rec, B, T, N)
+    saved for backward: v (B, T, N); recurrent activations A (K_rec, B, T, N); with
+        ``REFRACTORY``, which neurons were refractory (B, T, N) int8
     per-pathway tables: scale (K, N), made (K, SP)
     per-synapse tables, padded with zeros to SP, a power of two >= S:
         sign (SP), decay (SP)
@@ -53,6 +55,7 @@ import triton.language as tl
 
 from wiretorch.network_simulators.kernels import (  # noqa: F401 - re-exported
     _accumulate,
+    _refractory,
     _spike,
     _spike_adjoint,
     compact_spikes,
@@ -129,15 +132,19 @@ def _track(
 @triton.jit
 def scan_forward(
     A, scale, made, sign, decay, theta, U_reset, beta, U_rest, R,
-    v_state, I_state, spikes, prob, noise, v_saved, track_v, track_I,
-    surr_ptr, track_b, t0, TA, B, T, N,
+    v_state, I_state, spikes, prob, noise, n_ref, counter, v_saved, held_saved,
+    track_v, track_I, surr_ptr, track_b, t0, TA, B, T, N,
     K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
     SAVE: tl.constexpr, TRACK: tl.constexpr, PROB: tl.constexpr, SAMPLE: tl.constexpr,
+    REFRACTORY: tl.constexpr,
 ):  # fmt: skip
     """Integrate steps ``t0 .. t0 + TA`` of a ``T``-step chunk.
 
     ``A`` holds the pathway activations of just these ``TA`` steps, so a long chunk can
-    be fed in blocks; outputs are indexed by the step within the whole chunk.
+    be fed in blocks; outputs are indexed by the step within the whole chunk. With
+    ``REFRACTORY``, ``counter`` ``(B, N)`` int32 holds the steps of refractory period
+    left (``n_ref`` ``(N,)`` int32 the periods), and ``held_saved`` ``(B, T, N)`` int8
+    gets which neurons were refractory, for the backward pass.
     """
     surr_scale = tl.load(surr_ptr)  # read on the device: no host sync to pass it
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)  # flat (trial, neuron)
@@ -158,6 +165,9 @@ def scan_forward(
     v = tl.load(v_state + idx, mask=live)
     I_row = I_state + (b * (S * N) + n)[:, None] + j[None, :] * N
     I = tl.load(I_row, mask=sm, other=0.0).to(tl.float32)
+    if REFRACTORY:
+        n_ref_n = tl.load(n_ref + n, mask=live, other=0)
+        c = tl.load(counter + idx, mask=live, other=0)
 
     for i in range(TA):
         t = t0 + i
@@ -167,11 +177,19 @@ def scan_forward(
         else:
             u = 0.0
         s = _spike(v, theta_n, u, surr_scale, SAMPLE)
+        r = s  # what holds the voltage at reset
+        if REFRACTORY:
+            s, r, c, held = _refractory(s, c, n_ref_n)
         tl.store(spikes + out, s, mask=live)
         if PROB:
-            tl.store(prob + out, tl.sigmoid(surr_scale * (v - theta_n)), mask=live)
+            p = tl.sigmoid(surr_scale * (v - theta_n))
+            if REFRACTORY:
+                p = p * (1 - held)
+            tl.store(prob + out, p, mask=live)
         if SAVE:
             tl.store(v_saved + out, v, mask=live)
+            if REFRACTORY:
+                tl.store(held_saved + out, held.to(tl.int8), mask=live)
 
         I = I * dc[None, :]
         for k in tl.static_range(K):
@@ -180,24 +198,26 @@ def scan_forward(
             )
             sc = tl.load(scale + k * N + n, mask=live, other=0.0)
             I = _inject(I, a, sc, tl.load(made + k * SP + j))
-        v = _membrane(v, s, I, sg, U_reset_n, beta_n, U_rest_n, R_n)
+        v = _membrane(v, r, I, sg, U_reset_n, beta_n, U_rest_n, R_n)
         if TRACK:
             _track(track_v, track_I, b, n, t, T, N, j, live, v, I, track_b, S)
 
     tl.store(v_state + idx, v, mask=live)
     tl.store(I_row, I, mask=sm)
+    if REFRACTORY:
+        tl.store(counter + idx, c, mask=live)
 
 
 @triton.jit
 def scan_backward(
-    grad_spikes, grad_prob, spikes, v_saved, v_final, I_init, A, scale, made, sign,
-    decay, theta, beta, U_rest, R, grad_A, grad_scale,
+    grad_spikes, grad_prob, spikes, v_saved, v_final, I_init, held_saved, A, scale,
+    made, sign, decay, theta, beta, U_rest, R, grad_A, grad_scale,
     grad_theta, grad_reset, grad_beta, grad_rest, grad_R, grad_decay, surr_ptr, B, T, N,
     K: tl.constexpr, KP: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, WANT_A: tl.constexpr, WANT_SCALE: tl.constexpr,
     WANT_THETA: tl.constexpr, WANT_RESET: tl.constexpr, WANT_BETA: tl.constexpr,
     WANT_REST: tl.constexpr, WANT_R: tl.constexpr, WANT_DECAY: tl.constexpr,
-    PROB: tl.constexpr, SAMPLE: tl.constexpr,
+    PROB: tl.constexpr, SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
 ):  # fmt: skip
     """Backpropagate through ``T`` steps: the adjoint of ``scan_forward``.
 
@@ -206,6 +226,8 @@ def scan_backward(
     sums of the gradients w.r.t. each pathway's ``scale`` and the physiology wanted.
     ``v_final`` (B, N) is the voltage after the last step and ``I_init`` (B, S, N) the
     currents before the first (read only for ``beta``/``R`` and the decays).
+    ``held_saved`` (B, T, N) int8 marks the refractory steps (with ``REFRACTORY``):
+    there the voltage is held at reset, as after a spike, and the spike at zero.
     """
     surr_scale = tl.load(surr_ptr)
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -244,6 +266,9 @@ def scan_backward(
         out = (b * T + t) * N + n
         v = tl.load(v_saved + out, mask=live)
         s = tl.load(spikes + out, mask=live, other=0.0)
+        if REFRACTORY:  # held at reset: s stands for the reset below
+            held = tl.load(held_saved + out, mask=live, other=0).to(tl.float32)
+            s = tl.maximum(s, held)
 
         # v_next = (beta v + (1 - beta) (U_rest + R sum_j sign_j J_j)) (1 - s) + U s,
         # with J the currents after the input, which are also the next step's.
@@ -279,6 +304,8 @@ def scan_backward(
             p = tl.sigmoid(surr_scale * x)
             gp = tl.load(grad_prob + out, mask=live, other=0.0)
             gx += gp * surr_scale * p * (1.0 - p)
+        if REFRACTORY:  # a refractory neuron's spike and probability are held at 0
+            gx *= 1 - held
         lv += gx
         acc_theta -= gx
 
@@ -304,16 +331,17 @@ def scan_backward(
 @triton.jit
 def recurrent_step(
     A_ff, W, w_start, lists, counts, scale, made, sign, decay, theta, U_reset, beta,
-    U_rest, R, v_state, I_state, spikes, noise, v_saved, A_saved, track_v, track_I,
-    surr_ptr, track_b, t, t_ff, T, T_ff, B, N, L,
+    U_rest, R, v_state, I_state, spikes, noise, n_ref, counter, v_saved, A_saved,
+    held_saved, track_v, track_I, surr_ptr, track_b, t, t_ff, T, T_ff, B, N, L,
     K_REC: tl.constexpr, K_FF: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, ROWS: tl.constexpr, SAVE: tl.constexpr, TRACK: tl.constexpr,
-    SAMPLE: tl.constexpr,
+    SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
 ):  # fmt: skip
     """Advance a recurrent network one step, for one trial and a block of neurons.
 
     Recurrent activations are gathered from the weight rows listed by
-    ``compact_spikes``; feedforward ones are read from ``A_ff`` at ``t_ff``.
+    ``compact_spikes``; feedforward ones are read from ``A_ff`` at ``t_ff``. The
+    refractory period as in ``scan_forward``.
     """
     surr_scale = tl.load(surr_ptr)
     b = tl.program_id(0)
@@ -334,9 +362,16 @@ def recurrent_step(
     else:
         u = 0.0
     s = _spike(v, theta_n, u, surr_scale, SAMPLE)
+    r = s  # what holds the voltage at reset
+    if REFRACTORY:
+        c = tl.load(counter + idx, mask=live, other=0)
+        s, r, c, held = _refractory(s, c, tl.load(n_ref + n, mask=live, other=0))
+        tl.store(counter + idx, c, mask=live)
     tl.store(spikes + out, s, mask=live)
     if SAVE:
         tl.store(v_saved + out, v, mask=live)
+        if REFRACTORY:
+            tl.store(held_saved + out, held.to(tl.int8), mask=live)
 
     I = I * tl.load(decay + j)[None, :]
     for k in tl.static_range(K_REC + K_FF):
@@ -366,7 +401,7 @@ def recurrent_step(
         sc = tl.load(scale + k * N + n, mask=live, other=0.0)
         I = _inject(I, a, sc, tl.load(made + k * SP + j))
     v_next = _membrane(
-        v, s, I, tl.load(sign + j),
+        v, r, I, tl.load(sign + j),
         tl.load(U_reset + n, mask=live), tl.load(beta + n, mask=live),
         tl.load(U_rest + n, mask=live), tl.load(R + n, mask=live),
     )  # fmt: skip
@@ -379,12 +414,13 @@ def recurrent_step(
 
 @triton.jit
 def inject_backward(
-    lv, lI, H_state, spikes, v_saved, v_final, A, scale, made, sign, decay, beta,
-    U_rest, R, grad_A, grad_scale, grad_reset, grad_beta, grad_rest, grad_R, grad_decay,
-    t, B, T, N,
+    lv, lI, H_state, spikes, v_saved, v_final, held_saved, A, scale, made, sign, decay,
+    beta, U_rest, R, grad_A, grad_scale, grad_reset, grad_beta, grad_rest, grad_R,
+    grad_decay, t, B, T, N,
     K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
     WANT_SCALE: tl.constexpr, WANT_RESET: tl.constexpr, WANT_BETA: tl.constexpr,
     WANT_REST: tl.constexpr, WANT_R: tl.constexpr, WANT_DECAY: tl.constexpr,
+    REFRACTORY: tl.constexpr,
 ):  # fmt: skip
     """Step the adjoint back through the injection and integration of step ``t``.
 
@@ -394,6 +430,7 @@ def inject_backward(
     entering the step — ``lv`` still without its spike term, which needs every
     neuron's dL/da (``spike_backward``). ``H_state`` ``(B, S, N)`` carries the decays'
     ``H`` (see the module docstring); the engine adds the initial currents' term.
+    ``held_saved`` marks the refractory steps, as in ``scan_backward``.
     """
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = idx < B * N
@@ -407,6 +444,8 @@ def inject_backward(
     I_adj = tl.load(I_row, mask=sm, other=0.0)
     out = (b * T + t) * N + n
     s = tl.load(spikes + out, mask=live, other=0.0)
+    if REFRACTORY:  # held at reset: s stands for the reset below
+        s = tl.maximum(s, tl.load(held_saved + out, mask=live, other=0).to(tl.float32))
     beta_n = tl.load(beta + n, mask=live)
     R_n = tl.load(R + n, mask=live)
 

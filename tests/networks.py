@@ -110,6 +110,11 @@ SF_SPREAD = 0.15  # log-normal spread of the perturbed scaling factors
 RATE_HZ = {"mitral": 10.0, "excitatory": 8.0, "inhibitory": 25.0}
 
 
+def refractory(cells, tau_ref):
+    """``cells`` with a refractory period of ``tau_ref`` ms (unchanged if None)."""
+    return cells if tau_ref is None else [{**c, "tau_ref": tau_ref} for c in cells]
+
+
 def cell_types(rng, n, frac_e=0.8):
     types = np.full(n, I, dtype=np.int64)
     types[: round(frac_e * n)] = E
@@ -233,10 +238,12 @@ def recurrent(
     input_seed=0,
     learn=None,
     learnt_weights=False,
+    tau_ref=None,
 ):
     """``ConductanceLIFNetwork`` with frozen weights or perturbed scaling factors, and
     the physiology ``learn`` names; ``learnt_weights`` makes the recurrent weights
-    full-rank parameters (and the feedforward ones scaling factors)."""
+    full-rank parameters (and the feedforward ones scaling factors), ``tau_ref`` (ms)
+    gives every cell type a refractory period."""
     rng, types, w_rec, w_ff = _structure(seed, n, n_ff)
     ff_types = np.zeros(n_ff, dtype=np.int64)
     if learnt_weights:
@@ -275,7 +282,7 @@ def recurrent(
         ff_projections=ff,
         cell_type_indices=types,
         cell_type_indices_FF=ff_types,
-        cell_params=CELLS,
+        cell_params=refractory(CELLS, tau_ref),
         cell_params_FF=MITRAL_CELLS,
         synapse_params=SYNAPSES,
         synapse_params_FF=MITRAL_SYNAPSES,
@@ -305,10 +312,11 @@ def feedforward(
     n_steps=200,
     input_seed=0,
     learn=None,
+    tau_ref=None,
 ):
     """``FeedforwardConductanceLIFNetwork`` whose input rows are the external inputs and a
     ``recurrent`` network's neurons (as in teacher forcing), learning the physiology
-    ``learn`` names.
+    ``learn`` names, with a refractory period of ``tau_ref`` ms if given.
 
     Scaling factors on every pathway, or (``learnt_weights``) full-rank mitral, low-rank
     excitatory and scaling-factor inhibitory pathways — one of each caching mode.
@@ -344,7 +352,7 @@ def feedforward(
         projections=projections,
         cell_type_indices=types,
         cell_type_indices_FF=row_types,
-        cell_params=CELLS,
+        cell_params=refractory(CELLS, tau_ref),
         cell_params_FF=cells,
         synapse_params_FF=synapses,
         surrgrad_scale=5.0,
@@ -481,9 +489,10 @@ def current_recurrent(
     input_seed=None,
     former=False,
     learn=None,
+    tau_ref=None,
 ):
     """``CurrentLIFNetwork`` with learnt scaling factors (or ``optimisable`` weights),
-    and the physiology ``learn`` names.
+    the physiology ``learn`` names, and a refractory period of ``tau_ref`` ms if given.
 
     Connection probabilities scale with ``N / n`` and ``N_FF / n_ff``, as ``_structure``'s,
     so every neuron's expected in-degree is the same at any size. The input comes from
@@ -511,7 +520,7 @@ def current_recurrent(
         weights_FF=w_ff,
         cell_type_indices=types,
         cell_type_indices_FF=np.zeros(n_ff, dtype=np.int64),
-        cell_params=CURRENT_CELLS,
+        cell_params=refractory(CURRENT_CELLS, tau_ref),
         synapse_params=CURRENT_SYNAPSES,
         synapse_params_FF=CURRENT_SYNAPSES_FF,
         surrgrad_scale=5.0,
@@ -580,9 +589,9 @@ CURRENT_INPUT_SYNAPSES = [
 CURRENT_RATE_HZ = {E: 11.0, I: 7.0}  # the current_recurrent regime's rates
 
 
-def current_feedforward_probabilities(batch_size, seed, learn=None):
+def current_feedforward_probabilities(batch_size, seed, learn=None, tau_ref=None):
     """``FeedforwardCurrentLIFNetwork`` returning spike probabilities (and learning the
-    physiology ``learn`` names).
+    physiology ``learn`` names, with a refractory period of ``tau_ref`` ms if given).
 
     Rows: the external inputs, then the neurons of a ``current_recurrent`` network; one
     scaling factor per (input type, output type).
@@ -608,7 +617,7 @@ def current_feedforward_probabilities(batch_size, seed, learn=None):
         projections=projections,
         cell_type_indices=types,
         cell_type_indices_FF=row_types,
-        cell_params=CURRENT_CELLS,
+        cell_params=refractory(CURRENT_CELLS, tau_ref),
         cell_params_FF=CURRENT_INPUT_CELLS,
         synapse_params_FF=CURRENT_INPUT_SYNAPSES,
         surrgrad_scale=5.0,

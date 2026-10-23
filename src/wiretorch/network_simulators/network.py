@@ -114,14 +114,42 @@ def stack_steps(tensors: list[torch.Tensor]) -> torch.Tensor:
     return torch.stack([t.contiguous() for t in tensors], dim=1)
 
 
+def refractory_mask(counter: torch.Tensor, n_ref: torch.Tensor | None):
+    """Which neurons are refractory entering a step, as a float mask ``(B, N)``.
+
+    ``counter`` ``(B, N)`` holds the steps of refractory period each neuron has left;
+    ``n_ref`` ``(N,)`` is each neuron's period in steps, None if no neuron has one (the
+    mask is then None too). A refractory neuron cannot spike, and its voltage stays at
+    ``U_reset``; its synaptic state evolves as usual.
+    """
+    return None if n_ref is None else (counter > 0).float()
+
+
+def held_at_reset(s: torch.Tensor, held: torch.Tensor | None) -> torch.Tensor:
+    """What holds the voltage at reset this step: a spike, or the refractory period.
+
+    Detached: gradients never flow through the reset.
+    """
+    return s.detach() if held is None else torch.maximum(s.detach(), held)
+
+
+def count_down(s, counter, n_ref):
+    """The refractory counter after a step with spikes ``s``: ``n_ref`` where a neuron
+    spiked, else one step fewer (never below zero)."""
+    if n_ref is None:
+        return counter
+    return torch.where(s.detach() > 0, n_ref, (counter - 1).clamp(min=0))
+
+
 @dataclass
 class Run:
     """What a simulation produced.
 
     ``output`` is the network's output per step, ``(B, T, N)``: spikes, or rates for a
-    rate network. ``v`` and ``syn`` are the state after the last step. ``tracked`` (if
-    tracking) holds per-step variables of the tracked trial(s), named by the family's
-    dynamics.
+    rate network. ``v`` and ``syn`` are the state after the last step, and for a
+    spiking network ``refractory`` the steps of refractory period each neuron has left.
+    ``tracked`` (if tracking) holds per-step variables of the tracked trial(s), named by
+    the family's dynamics.
     """
 
     output: torch.Tensor
@@ -129,6 +157,7 @@ class Run:
     syn: torch.Tensor
     probabilities: torch.Tensor | None = None
     tracked: dict[str, torch.Tensor] | None = None
+    refractory: torch.Tensor | None = None
 
     @property
     def spikes(self) -> torch.Tensor:
@@ -147,9 +176,10 @@ class ProjectionNetwork(nn.Module):
     Subclasses describe their input sides, register their physiology tables
     (``_register_physiology``), derive what depends on the time step
     (``_set_timestep``), and supply the engine and its parameters (``_engine``,
-    ``_physiology``). The state — ``v`` ``(B, N)`` and the synaptic state named
-    ``state_name`` ``(B, N, ..., S)`` — continues from one ``forward`` call to the next
-    until ``reset_state``.
+    ``_physiology``). The state — ``v`` ``(B, N)``, the synaptic state named
+    ``state_name`` ``(B, N, ..., S)`` and, in a spiking network, the refractory
+    counters ``refractory`` ``(B, N)`` — continues from one ``forward`` call to the
+    next until ``reset_state``.
     """
 
     #: Name of the synaptic state (also its checkpoint key).
@@ -161,6 +191,11 @@ class ProjectionNetwork(nn.Module):
     #: Whether gradients flow through the recurrent spikes (see ``Drive``); the
     #: recurrent networks take it as an argument.
     recurrent_gradients = False
+    #: Whether the family has a refractory period (the spiking ones): its state then
+    #: also counts, per neuron, the steps of it left (``refractory``).
+    has_refractory = False
+    #: Whether any neuron's refractory period is at least one step.
+    _refractory = False
 
     def __init__(
         self,
@@ -285,6 +320,23 @@ class ProjectionNetwork(nn.Module):
                 cell[name] if default is None else cell.get(name, default)
             )
         return torch.from_numpy(lookup[np.asarray(self.cell_type_indices.cpu())])
+
+    def _register_refractory(self) -> None:
+        """``tau_ref``, each neuron's refractory period (ms; cell parameter, default 0).
+
+        Not saved with the module: it comes from the cell parameters (older checkpoints
+        carry a ``tau_ref`` of their own, which loading discards).
+        """
+        tau_ref = self._per_neuron("tau_ref", 0.0)
+        assert (tau_ref >= 0).all(), "cell_params: tau_ref must be >= 0"
+        self.register_buffer("tau_ref", tau_ref, persistent=False)
+
+    def _set_refractory(self) -> None:
+        """``n_ref``, each neuron's refractory period in steps: ``tau_ref / dt``,
+        rounded."""
+        n_ref = torch.round(self.tau_ref / self.dt).to(torch.int32)
+        self.register_buffer("n_ref", n_ref, persistent=False)
+        self._refractory = bool(n_ref.any())
 
     def _register_learnt(
         self,
@@ -535,6 +587,7 @@ class ProjectionNetwork(nn.Module):
             input_spikes.to(self.dt.dtype),
             self._drive(),
             self._physiology(),
+            **({"refractory": self.refractory} if self.has_refractory else {}),
             probabilities=probabilities,
             track=self.track_variables,
             track_batch_idx=self.track_batch_idx,
@@ -545,6 +598,8 @@ class ProjectionNetwork(nn.Module):
         # Detach: the next chunk must not backpropagate into this one's graph.
         self.v = run.v.detach()
         self._synaptic = run.syn.detach()
+        if run.refractory is not None:
+            self.refractory = run.refractory
         return run
 
     def _validate_forward(self, input_spikes: torch.Tensor) -> None:
@@ -583,16 +638,32 @@ class ProjectionNetwork(nn.Module):
         v, syn = self._initial_state()
         self.register_buffer("v", v, persistent=False)
         self.register_buffer(self.state_name, syn, persistent=False)
+        if self.has_refractory:
+            counter = torch.zeros(
+                (self.batch_size, self.n_neurons), dtype=torch.int32, device=self.device
+            )
+            self.register_buffer("refractory", counter, persistent=False)
 
     def get_checkpoint_state(self) -> dict[str, np.ndarray]:
-        return {
+        """The state; the refractory counters only if a neuron has a refractory period
+        (they are zero otherwise)."""
+        state = {
             "v": self.v.cpu().numpy(),
             self.state_name: self._synaptic.cpu().numpy(),
         }
+        if self._refractory:
+            state["refractory"] = self.refractory.cpu().numpy()
+        return state
 
     def load_checkpoint_state(self, state: dict[str, np.ndarray]) -> None:
         self.v = torch.from_numpy(state["v"]).to(self.device)
         self._synaptic = torch.from_numpy(state[self.state_name]).to(self.device)
+        if self.has_refractory:
+            self.refractory = (
+                torch.from_numpy(state["refractory"]).to(self.device)
+                if "refractory" in state
+                else torch.zeros_like(self.v, dtype=torch.int32)
+            )
 
     def get_tracked_gradients(self) -> dict[str, torch.Tensor]:
         """Gradients of the tracked per-step ``v``, synaptic state and output.

@@ -32,7 +32,7 @@ class RecurrentLayerConfig(Config):
 
         Returns:
             List of dicts with keys: 'name', 'cell_id', 'tau_mem', 'tau_syn',
-            'R', 'U_rest', 'theta', 'U_reset'.
+            'R', 'U_rest', 'theta', 'U_reset', 'tau_ref'.
         """
         cell_params = []
         for i, cell_type_name in enumerate(self.cell_types.names):
@@ -47,6 +47,7 @@ class RecurrentLayerConfig(Config):
                     "U_rest": physiology.U_rest,
                     "theta": physiology.theta,
                     "U_reset": physiology.U_reset,
+                    "tau_ref": physiology.tau_ref,
                 }
             )
         return cell_params

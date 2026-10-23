@@ -60,6 +60,7 @@ class ConductanceNetwork(ProjectionNetwork):
     #: Name of the conductance state (also its checkpoint key).
     state_name = "g"
     _engine = engine
+    has_refractory = True
 
     def __init__(
         self,
@@ -128,6 +129,7 @@ class ConductanceNetwork(ProjectionNetwork):
             self.register_buffer(name, table)
         for name, table in synapse_tables(self.registry).items():
             self.register_buffer(name, table)
+        self._register_refractory()
         self.register_buffer(
             "surrgrad_scale", torch.tensor(self._surrgrad_scale, dtype=torch.float32)
         )
@@ -165,6 +167,7 @@ class ConductanceNetwork(ProjectionNetwork):
         self.register_buffer(
             "g_scale", conductance_kernel(self.tau_rise, self.tau_decay, self.g_bar)
         )
+        self._set_refractory()
 
     def _physiology(self) -> Physiology:
         learnt = self._learnt
@@ -190,6 +193,7 @@ class ConductanceNetwork(ProjectionNetwork):
             surr_scale=self.surrgrad_scale,
             spike_mode=self.spike_mode,
             storage_dtype=self.storage_dtype,
+            n_ref=self.n_ref if self._refractory else None,
         )
 
     def _initial_state(self) -> tuple[torch.Tensor, torch.Tensor]:

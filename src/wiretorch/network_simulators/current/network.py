@@ -63,6 +63,7 @@ class CurrentNetwork(ProjectionNetwork):
 
     state_name = "I_syn"
     _engine = engine
+    has_refractory = True
     #: What ``from_weights`` was asked to train (the former API's ``optimisable``).
     optimisable = None
 
@@ -122,6 +123,7 @@ class CurrentNetwork(ProjectionNetwork):
         self.register_buffer("U_reset", self._per_neuron("U_reset", U_RESET))
         self.register_buffer("U_rest", self._per_neuron("U_rest", U_REST))
         self.register_buffer("R", self._per_neuron("R", R))
+        self._register_refractory()
         self.register_buffer("tau_syn", self.registry.table("tau_syn"))
         self.register_buffer(
             "sign",
@@ -141,6 +143,7 @@ class CurrentNetwork(ProjectionNetwork):
         # tau_syn = 0 gives exp(-inf) = 0: a current with no memory.
         self.register_buffer("alpha", torch.exp(-self.dt / self.tau_syn))
         self.register_buffer("beta", torch.exp(-self.dt / self.tau_mem))
+        self._set_refractory()
 
     def _physiology(self) -> Physiology:
         learnt = self._learnt
@@ -155,6 +158,7 @@ class CurrentNetwork(ProjectionNetwork):
             surr_scale=self.surrgrad_scale,
             spike_mode=self.spike_mode,
             storage_dtype=self.storage_dtype,
+            n_ref=self.n_ref if self._refractory else None,
         )
 
     def _initial_state(self) -> tuple[torch.Tensor, torch.Tensor]:

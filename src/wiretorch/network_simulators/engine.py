@@ -168,3 +168,23 @@ def weight_gradient(spikes, rows, sizes, grad_A) -> torch.Tensor:
         pre = spikes[:, :, rows[a:b]]
         pieces.append(pre.reshape(-1, pre.shape[-1]).T @ grad_A[k].reshape(-1, N))
     return torch.cat(pieces)
+
+
+def refractory_tables(n_ref, counter, dummy) -> tuple[torch.Tensor, torch.Tensor]:
+    """The kernels' refractory arguments: the periods in steps ``(N,)`` int32, and a
+    copy of the counters ``(B, N)`` int32 that the kernels update in place — dummies
+    if no neuron has a refractory period (``n_ref`` None)."""
+    if n_ref is None:
+        return dummy, dummy
+    return (
+        n_ref.to(torch.int32).contiguous(),
+        counter.to(torch.int32, copy=True).contiguous(),
+    )
+
+
+def held_buffer(B, T, N, refractory, dummy) -> torch.Tensor:
+    """Where the forward pass tells the backward pass which steps were refractory:
+    ``(B, T, N)`` int8, or a dummy."""
+    if not refractory:
+        return dummy
+    return torch.empty((B, T, N), dtype=torch.int8, device=dummy.device)

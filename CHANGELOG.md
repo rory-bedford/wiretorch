@@ -8,6 +8,11 @@ The release notes of each version on GitHub are taken from its section here.
   gradients flow through the recurrent spikes into the presynaptic neurons. Both
   families now support both settings, with Triton kernels for each. The defaults are
   unchanged: off for conductance-based networks, on for current-based ones.
+- Refractory period `tau_ref` (ms, per cell type, default 0) in both spiking families,
+  with Triton kernels: for that long after a spike a neuron is held at `U_reset` and
+  cannot spike. The counters are part of the state, carried across `forward` calls and
+  checkpoints. `tau_ref` in a config was accepted and ignored before: **configs that
+  set it now get the refractory period they name.**
 
 ## [0.1.0b1] - 2026-10-22
 

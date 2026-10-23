@@ -19,9 +19,11 @@ entries depend on the neuron model:
 
 | Neuron model | Required | Optional (default) |
 |---|---|---|
-| Conductance-based | `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L` | — |
-| Current-based | `tau_mem` | `theta` (1), `U_reset` (0), `U_rest` (0), `R` (1) |
+| Conductance-based | `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L` | `tau_ref` (0) |
+| Current-based | `tau_mem` | `theta` (1), `U_reset` (0), `U_rest` (0), `R` (1), `tau_ref` (0) |
 | Rate | `tau_mem`, `nonlinearity` | `theta` (0), `gain` (1) |
+
+`tau_ref` is the refractory period in ms (see {doc}`neuron-models`).
 
 ## Synapse types
 

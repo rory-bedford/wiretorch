@@ -1,5 +1,5 @@
 """Layer configs derive the same parameter tables as when the fixture was recorded
-(less the refractory period ``tau_ref``, removed since: it was never simulated)."""
+(but for the refractory period ``tau_ref``: see ``test_layer_config_outputs``)."""
 
 import json
 
@@ -9,18 +9,33 @@ from fixtures.generate import config_outputs
 
 def test_layer_config_outputs():
     recorded = json.loads((fixture_io.FIXTURES / "configs.json").read_text())["outputs"]
+    # Recorded with the teacher's tau_ref of 8 ms, which was never simulated then and
+    # which the benchmark's copy of its parameters no longer sets: the default, 0.
     for cell in recorded["recurrent.get_cell_params"]:
-        del cell["tau_ref"]
+        cell["tau_ref"] = 0.0
     assert config_outputs() == recorded
 
 
-def test_old_configs_with_tau_ref_still_parse():
-    from wiretorch.configs.conductance_based import PhysiologyConfig
+def test_tau_ref_is_the_refractory_period():
+    """``tau_ref``, once accepted and ignored, is the refractory period again (default
+    0), in both families' configs and the cell parameters they derive."""
+    from wiretorch.configs import conductance_based, current_based
 
-    config = PhysiologyConfig(
-        tau_mem=20.0, theta=-50.0, U_reset=-60.0, E_L=-60.0, g_L=1.0, tau_ref=2.0
-    )
-    assert "tau_ref" not in config.model_dump()
+    common = dict(tau_mem=20.0, theta=-50.0, U_reset=-60.0)
+    conductance = dict(E_L=-60.0, g_L=1.0, **common)
+    current = dict(tau_syn=5.0, R=1.0, U_rest=-60.0, **common)
+    assert conductance_based.PhysiologyConfig(**conductance).tau_ref == 0.0
+    assert current_based.PhysiologyConfig(**current).tau_ref == 0.0
+    for family, physiology in (
+        (conductance_based, conductance),
+        (current_based, current),
+    ):
+        layer = family.RecurrentLayerConfig(
+            cell_types=dict(names=["e"], proportion=[1.0]),
+            physiology={"e": {**physiology, "tau_ref": 2.0}},
+            **({"synapses": {}} if family is conductance_based else {}),
+        )
+        assert layer.get_cell_params()[0]["tau_ref"] == 2.0
 
 
 def test_unknown_keys_are_errors():

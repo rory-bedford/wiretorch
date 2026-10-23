@@ -113,7 +113,7 @@ class RecurrentLayerConfig(_SynapticLayerConfig):
 
     def get_cell_params(self) -> List[Dict[str, float | int | str]]:
         """One dict per cell type: 'name', 'cell_id', 'tau_mem', 'theta', 'U_reset',
-        'E_L', 'g_L'."""
+        'E_L', 'g_L', 'tau_ref'."""
         return [
             {"name": name, "cell_id": i, **self.physiology[name].model_dump()}
             for i, name in enumerate(self.cell_types.names)

@@ -25,6 +25,9 @@ class CurrentLIFNetwork(CurrentNetwork):
     ``current.dynamics`` for the time step. Gradients flow through the recurrent spikes
     unless ``recurrent_gradients`` is False (``ConductanceLIFNetwork``'s default).
 
+    A cell type with a refractory period ``tau_ref`` (ms, rounded to whole steps) holds
+    its neurons at ``U_reset`` for that long after each spike, unable to spike.
+
     The state (``v``, ``I_syn``) continues across ``forward`` calls, so a long
     simulation can be run in chunks; call ``reset_state()`` before an independent one.
     ``from_weights`` builds the network from the former weight-matrix arguments.
@@ -68,7 +71,9 @@ class CurrentLIFNetwork(CurrentNetwork):
             cell_type_indices_FF: Cell type of each input, ``(n_inputs,)``.
             cell_params: Neuron cell types: 'name', 'cell_id', 'tau_mem', and
                 optionally 'theta' (default 1), 'U_reset' (default 0), 'U_rest'
-                (default 0) and 'R' (default 1) — natural units by default.
+                (default 0), 'R' (default 1) — natural units by default — and
+                'tau_ref' (the refractory period, default 0 ms: see the class
+                docstring).
             cell_params_FF: Input cell types ('name', 'cell_id').
             synapse_params, synapse_params_FF: Synapses made by each side's cell types:
                 'synapse_id', 'cell_id', 'name', 'tau_syn' (0 for a current with no

@@ -9,14 +9,12 @@ from ..base import Config
 class PhysiologyConfig(Config):
     """Neuronal physiology parameters for conductance-based models."""
 
-    #: The refractory period, never simulated (removed; old files still carry it).
-    LEGACY_KEYS = ("tau_ref",)
-
     tau_mem: float  # Membrane time constant (ms)
     theta: float  # Spike threshold voltage (mV)
     U_reset: float  # Reset voltage after spike (mV)
     E_L: float  # Leak reversal potential (mV)
     g_L: float  # Leak conductance (nS)
+    tau_ref: float = 0.0  # Refractory period (ms): held at U_reset, no spikes
 
 
 # Synapse type constants

@@ -41,6 +41,17 @@ independent of the time step. The defaults are natural units: $\theta = 1$,
 $U_\text{reset} = U_\text{rest} = 0$, $R = 1$. By default gradients also flow
 through recurrent spikes.
 
+## Refractory period
+
+Both spiking models take an optional refractory period `tau_ref` per cell type, in ms.
+It is rounded to a whole number of steps,
+$n_\text{ref} = \operatorname{round}(\tau_\text{ref} / \Delta t)$. For the $n_\text{ref}$
+steps after a spike, $v$ is held at $U_\text{reset}$ and the neuron cannot spike, even
+with escape noise. Its synaptic conductances or currents keep evolving. A counter per
+neuron is part of the state, so the period continues across `forward` calls and is
+saved in checkpoints. Gradients do not flow through a held voltage, as with the reset.
+The default, 0, gives the model without a refractory period.
+
 ## Gradients through recurrent spikes
 
 In a recurrent spiking network, a spike reaches the loss directly and also through the
