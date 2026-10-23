@@ -10,10 +10,13 @@ follow line for line. One step, for every neuron of every trial:
    clipped to ``[0, g_clip]``, times the driving force ``v - E_syn``; plus the leak.
    An NMDA-like synapse type scales its current by its voltage-dependent Mg block.
 3. **Integrate** the voltage with exponential Euler — exact for the conductances held
-   over the step, so stable however large they are — and reset the neurons that
-   spiked; a
+   over the step, so stable however large they are, the adaptation's among them — and
+   reset the neurons that spiked; a
    neuron stays at reset for the ``n_ref`` steps after its spike (its refractory
    period), and a counter per neuron (``refractory``, part of the state) tracks them.
+   A neuron that adapts has a conductance ``g_a`` by ``E_adapt`` (part of the state,
+   ``adaptation``), which decays with ``tau_adapt`` and rises by ``adapt`` at each of
+   its spikes.
 4. **Decay** each conductance component, then **inject** this step's input: every
    pathway adds its activation (presynaptic spikes times weights) times its kernel.
    A pathway with presynaptic dynamics — short-term plasticity, a saturating synapse
@@ -62,6 +65,8 @@ class Physiology:
     neuron has one.
     ``mg_c``, ``mg_a`` ``(S,)`` are each synapse type's Mg block (see
     ``synapses.mg_block_tables``), or None if no synapse type has one.
+    ``adapt``, ``adapt_decay``, ``E_adapt`` ``(N,)`` are each neuron's adaptation: its
+    rise per spike, per-step decay and reversal potential, or None if none adapts.
     """
 
     theta: torch.Tensor
@@ -82,6 +87,9 @@ class Physiology:
     n_ref: torch.Tensor | None = None
     mg_c: torch.Tensor | None = None
     mg_a: torch.Tensor | None = None
+    adapt: torch.Tensor | None = None
+    adapt_decay: torch.Tensor | None = None
+    E_adapt: torch.Tensor | None = None
 
 
 def jumps(drive: Drive, jump: torch.Tensor) -> list[torch.Tensor]:
@@ -105,9 +113,10 @@ def mg_block(v, mg_c, mg_a):
     return torch.sigmoid(mg_a * v[:, :, None] - torch.log(mg_c))
 
 
-def membrane(v, s, g, p: Physiology):
+def membrane(v, s, g, p: Physiology, g_a=None):
     """Currents and the voltage after the step, reset where ``s`` (a spike, or the
-    refractory period: see ``held_at_reset``). Returns ``(v_next, I, I_leak)``.
+    refractory period: see ``held_at_reset``); ``g_a`` ``(B, N)`` is the adaptation
+    conductance, if any. Returns ``(v_next, I, I_leak)``.
 
     With the conductances held over the step, ``C_m dv/dt = -g_tot (v - V_inf)`` is
     linear: ``v`` relaxes towards ``V_inf`` by the factor ``a = exp(-dt g_tot / C_m)``,
@@ -123,10 +132,14 @@ def membrane(v, s, g, p: Physiology):
     g_L = p.C_m * rate
     I_leak = g_L * (v - p.E_L)
     G = g_total.sum(dim=2)
+    J = I.sum(dim=2) + I_leak
+    if g_a is not None:
+        G = G + g_a
+        J = J + g_a * (v - p.E_adapt)
     x = p.dt * rate + p.dt * G / p.C_m  # dt g_tot / C_m
     step = -torch.expm1(-x) / (g_L + G)  # (1 - a) / g_tot, precisely
     s = s.detach()
-    v_next = (v - step * (I.sum(dim=2) + I_leak)) * (1 - s) + p.U_reset * s
+    v_next = (v - step * J) * (1 - s) + p.U_reset * s
     return v_next, I, I_leak
 
 
@@ -139,6 +152,7 @@ def simulate(
     *,
     refractory: torch.Tensor | None = None,
     gating: torch.Tensor | None = None,
+    adaptation: torch.Tensor | None = None,
     probabilities: bool = False,
     track: bool = False,
     track_batch_idx: int | None = None,
@@ -153,8 +167,8 @@ def simulate(
     Args:
         v, g: State, ``(B, N)`` and ``(B, N, 2, S)``.
         refractory: Steps of refractory period left, ``(B, N)`` int32 (None: none).
-        gating: The saturating pathways' gating variables ``(B, R)`` (see ``Drive``),
-            if any.
+        gating: The presynaptic pathways' state ``(B, R)`` (see ``Drive``), if any.
+        adaptation: Each neuron's adaptation conductance ``(B, N)``, if any adapts.
         x: Feedforward input, ``(B, T, n_inputs)``.
         probabilities: Also return the escape-noise spike probability per step.
         track, track_batch_idx: Record ``Run.tracked``, for one trial or all (None).
@@ -169,7 +183,10 @@ def simulate(
         if track_batch_idx is None
         else slice(track_batch_idx, track_batch_idx + 1)
     )
-    spikes, probs, tracked = [], [], {"v": [], "I": [], "g": []}
+    spikes, probs, tracked = [], [], {"v": [], "I": [], "g": [], "a": []}
+    g_a = adaptation if p.adapt is not None else None
+    if g_a is None and p.adapt is not None:
+        g_a = torch.zeros_like(v)
     if refractory is None:
         refractory = torch.zeros(v.shape, dtype=torch.int32, device=v.device)
 
@@ -179,8 +196,10 @@ def simulate(
         if probabilities:
             prob = torch.sigmoid(p.surr_scale * (v - p.theta))
             probs.append(prob if held is None else prob * (1 - held))
-        v_next, I, I_leak = membrane(v, held_at_reset(s, held), g, p)
+        v_next, I, I_leak = membrane(v, held_at_reset(s, held), g, p, g_a)
         refractory = count_down(s, refractory, p.n_ref)
+        if g_a is not None:  # the neuron's own spike raises it (no gradient, as reset)
+            g_a = g_a * p.adapt_decay + p.adapt * s.detach()
         s_rec = s if drive.recurrent_gradients else s.detach()
         activations = recurrent_activations(drive, s_rec, gates, state)
         activations += list(A_ff[:, :, t])
@@ -201,13 +220,18 @@ def simulate(
                 torch.cat([I, I_leak[..., None]], dim=-1)[keep].detach()
             )
             tracked["g"].append(g[keep].detach())
+            if g_a is not None:
+                tracked["a"].append(g_a[keep].detach())
 
     return Run(
         output=torch.stack(spikes, dim=1),
         v=v,
         syn=g,
         probabilities=torch.stack(probs, dim=1) if probabilities else None,
-        tracked={k: stack_steps(val) for k, val in tracked.items()} if track else None,
+        tracked={k: stack_steps(val) for k, val in tracked.items() if val}
+        if track
+        else None,
         refractory=refractory,
+        adaptation=g_a,
         gating=updated_gating(gating, gates, state),
     )

@@ -157,6 +157,7 @@ class ConductanceLIFNetwork(ConductanceNetwork):
         return {
             "spikes": run.spikes,
             "voltages": run.tracked["v"],
+            **({"adaptation": run.tracked["a"]} if "a" in run.tracked else {}),
             "currents": run.tracked["I"][..., :S],
             "currents_leak": run.tracked["I"][..., S],
             "conductances": run.tracked["g"],

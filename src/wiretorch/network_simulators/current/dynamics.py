@@ -65,6 +65,8 @@ class Physiology:
     current).
     ``n_ref`` ``(N,)`` int32 is each neuron's refractory period in steps, or None if no
     neuron has one.
+    ``adapt``, ``adapt_decay`` ``(N,)`` are each neuron's adaptation current: its rise
+    per spike and per-step decay, or None if none adapts.
     """
 
     theta: torch.Tensor
@@ -80,6 +82,8 @@ class Physiology:
     #: in float32 regardless); the PyTorch reference ignores it.
     storage_dtype: torch.dtype = torch.float32
     n_ref: torch.Tensor | None = None
+    adapt: torch.Tensor | None = None
+    adapt_decay: torch.Tensor | None = None
 
 
 def kernels(drive: Drive) -> list[torch.Tensor]:
@@ -94,11 +98,14 @@ def spike(v: torch.Tensor, p: Physiology, held=None) -> torch.Tensor:
     return s if held is None else s * (1 - held)
 
 
-def membrane(v, s, I, p: Physiology) -> torch.Tensor:
-    """The voltage after the step: leak, the signed synaptic currents, and the reset
-    where ``s`` (a spike, or the refractory period: see ``held_at_reset``)."""
+def membrane(v, s, I, p: Physiology, I_a=None) -> torch.Tensor:
+    """The voltage after the step: leak, the signed synaptic currents less the
+    adaptation current ``I_a`` (if any), and the reset where ``s`` (a spike, or the
+    refractory period: see ``held_at_reset``)."""
     # Summed one synapse type at a time, in index order (the kernels sum the same way).
     I_syn = sum(I[..., j] * p.sign[j] for j in range(I.shape[-1]))
+    if I_a is not None:
+        I_syn = I_syn - I_a
     s = s.detach()
     return (p.beta * v + (1 - p.beta) * (p.U_rest + p.R * I_syn)) * (
         1 - s
@@ -114,6 +121,7 @@ def simulate(
     *,
     refractory: torch.Tensor | None = None,
     gating: torch.Tensor | None = None,
+    adaptation: torch.Tensor | None = None,
     probabilities: bool = False,
     track: bool = False,
     track_batch_idx: int | None = None,
@@ -126,6 +134,7 @@ def simulate(
         refractory: Steps of refractory period left, ``(B, N)`` int32 (None: none).
         gating: The presynaptic pathways' state ``(B, R)`` (short-term plasticity:
             see ``Drive``), if any.
+        adaptation: Each neuron's adaptation current ``(B, N)``, if any adapts.
         x: Feedforward input, ``(B, T, n_inputs)``.
         probabilities: Also return the escape-noise spike probability per step.
         track, track_batch_idx: Record ``Run.tracked``, for one trial or all (None):
@@ -141,7 +150,10 @@ def simulate(
         if track_batch_idx is None
         else slice(track_batch_idx, track_batch_idx + 1)
     )
-    spikes, probs, tracked = [], [], {"v": [], "I": []}
+    spikes, probs, tracked = [], [], {"v": [], "I": [], "a": []}
+    I_a = None
+    if p.adapt is not None:
+        I_a = torch.zeros_like(v) if adaptation is None else adaptation
     if refractory is None:
         refractory = torch.zeros(v.shape, dtype=torch.int32, device=v.device)
 
@@ -158,7 +170,9 @@ def simulate(
         I = I * p.decay
         for a, jump in zip(activations, jumps):
             I = I + a[:, :, None] * jump
-        v = membrane(v, held_at_reset(s, held), I, p)
+        if I_a is not None:  # the neuron's own spike raises it (no gradient, as reset)
+            I_a = I_a * p.adapt_decay + p.adapt * s.detach()
+        v = membrane(v, held_at_reset(s, held), I, p, I_a)
         refractory = count_down(s, refractory, p.n_ref)
 
         spikes.append(s)
@@ -170,13 +184,18 @@ def simulate(
         if track:
             tracked["v"].append(v[keep].detach())
             tracked["I"].append(I[keep].detach())
+            if I_a is not None:
+                tracked["a"].append(I_a[keep].detach())
 
     return Run(
         output=torch.stack(spikes, dim=1),
         v=v,
         syn=I,
         probabilities=torch.stack(probs, dim=1) if probabilities else None,
-        tracked={k: stack_steps(val) for k, val in tracked.items()} if track else None,
+        tracked={k: stack_steps(val) for k, val in tracked.items() if val}
+        if track
+        else None,
         refractory=refractory,
+        adaptation=I_a,
         gating=updated_gating(gating, gates, state),
     )

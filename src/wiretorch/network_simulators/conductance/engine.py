@@ -70,7 +70,8 @@ FF_TIME_BLOCK = 256  # steps of feedforward input materialised at once (no gradi
 
 def simulate(
     v, g, x, drive: Drive, p: Physiology, *, refractory=None, gating=None,
-    probabilities=False, track=False, track_batch_idx=None, retain=None,
+    adaptation=None, probabilities=False, track=False, track_batch_idx=None,
+    retain=None,
 ) -> Run:  # fmt: skip
     """Simulate ``x.shape[1]`` steps; see ``dynamics.simulate`` for the arguments."""
     if refractory is None:
@@ -78,12 +79,14 @@ def simulate(
     if not uses_kernels(x, retain):
         return dynamics.simulate(
             v, g, x, drive, p, refractory=refractory, gating=gating,
+            adaptation=adaptation,
             probabilities=probabilities, track=track,
             track_batch_idx=track_batch_idx, retain=retain,
         )  # fmt: skip
     return _simulate_kernels(
-        v, g, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
-    )
+        v, g, x, drive, p, refractory, gating, adaptation, probabilities, track,
+        track_batch_idx,
+    )  # fmt: skip
 
 
 # =====================================================================
@@ -117,7 +120,7 @@ class _Launch:
     tracked: dict[str, torch.Tensor] | None
     dummy: torch.Tensor  # stands in for unused pointer arguments
     #: Which physiology gradients are wanted, in ``PHYSIOLOGY`` order.
-    wants: tuple[bool, ...] = (False,) * 8
+    wants: tuple[bool, ...] = (False,) * 11
     #: Whether gradients flow through the recurrent spikes (see ``Drive``).
     recurrent_gradients: bool = False
     #: The refractory periods in steps, ``(N,)`` int32, and the counters of the steps
@@ -126,6 +129,8 @@ class _Launch:
     counter: torch.Tensor | None = None
     #: The recurrent pathways' presynaptic dynamics.
     gating: Gating | None = None
+    #: The adaptation conductances ``(B, N)`` (updated in place), or a dummy.
+    a_state: torch.Tensor | None = None
 
     @property
     def K(self) -> int:
@@ -141,6 +146,25 @@ class _Launch:
         """Whether any synapse type has a Mg block (the kernels' ``MG_BLOCK``)."""
         return self.p.mg_c is not None
 
+    @property
+    def adapting(self) -> bool:
+        """Whether any neuron adapts (the kernels' ``ADAPT``)."""
+        return self.p.adapt is not None
+
+    def adaptation(self) -> tuple[torch.Tensor, ...]:
+        """The kernels' adaptation arguments: ``adapt``, ``adapt_decay``, ``E_adapt``
+        and the state, or dummies."""
+        if not self.adapting:
+            return (self.dummy,) * 4
+        p = self.p
+        return p.adapt, p.adapt_decay, p.E_adapt, self.a_state
+
+    def a_saved(self) -> torch.Tensor:
+        """Where the forward pass keeps each step's adaptation for the backward pass."""
+        if not self.adapting:
+            return self.dummy
+        return torch.empty((self.B, self.T, self.N), device=self.dummy.device)
+
     def held(self) -> torch.Tensor:
         return held_buffer(self.B, self.T, self.N, self.refractory, self.dummy)
 
@@ -151,7 +175,7 @@ class _Launch:
         """Neurons per program of ``scan_backward``: half the usual when the learnt
         physiology needs six or more per-synapse accumulators (each ``(BLOCK, SP)``),
         which would otherwise spill registers."""
-        E_syn, decay, jump = self.wants[5:]
+        E_syn, decay, jump = self.wants[5:8]
         tiles = E_syn + 4 * decay + 2 * jump  # the decays carry H as well
         return BLOCK // 2 if tiles >= 6 else BLOCK
 
@@ -163,13 +187,24 @@ class _Launch:
 
 #: The physiology that can be learnt, as ``Physiology`` names it, and the names of
 #: ``scan_backward``'s flags for each.
-PHYSIOLOGY = ("theta", "U_reset", "E_L", "C_m", "beta", "E_syn", "decay", "jump")
-FLAGS = ("theta", "reset", "E_L", "C_m", "beta", "E_syn", "decay", "jump")
+PHYSIOLOGY = (
+    "theta", "U_reset", "E_L", "C_m", "beta", "E_syn", "decay", "jump",
+    "adapt", "adapt_decay", "E_adapt",
+)  # fmt: skip
+FLAGS = (
+    "theta", "reset", "E_L", "C_m", "beta", "E_syn", "decay", "jump",
+    "adapt", "adapt_decay", "E_adapt",
+)  # fmt: skip
 
 
 def _physiology_grads(L: _Launch, device) -> list[torch.Tensor]:
     """Zeroed per-(trial, [synapse,] neuron) accumulators of the gradients wanted."""
-    shapes = [(L.B, L.N)] * 5 + [(L.B, L.S, L.N)] + [(L.B, 2, L.S, L.N)] * 2
+    shapes = (
+        [(L.B, L.N)] * 5
+        + [(L.B, L.S, L.N)]
+        + [(L.B, 2, L.S, L.N)] * 2
+        + [(L.B, L.N)] * 3
+    )
     return [
         torch.zeros(shape, device=device) if want else L.dummy
         for shape, want in zip(shapes, L.wants)
@@ -178,13 +213,14 @@ def _physiology_grads(L: _Launch, device) -> list[torch.Tensor]:
 
 def _reduce(partials, wants) -> list[torch.Tensor | None]:
     """Per-neuron (per-synapse; per component and synapse) sums of the accumulators."""
-    dims = [0] * 5 + [(0, 2)] + [(0, 3)] * 2
+    dims = [0] * 5 + [(0, 2)] + [(0, 3)] * 2 + [0] * 3
     return [g.sum(d) if want else None for g, d, want in zip(partials, dims, wants)]
 
 
 def _prepare(
-    v, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
-) -> _Launch:
+    v, x, drive, p, refractory, gating, adaptation, probabilities, track,
+    track_batch_idx,
+) -> _Launch:  # fmt: skip
     B, T = x.shape[:2]
     N = v.shape[1]
     S = p.E_syn.shape[0]
@@ -199,6 +235,8 @@ def _prepare(
             "I": torch.empty((Bt, T, N, S + 1), device=x.device),
             "g": torch.empty((Bt, T, N, 2, S), device=x.device),
         }
+        if p.adapt is not None:
+            tracked["a"] = torch.empty((Bt, T, N), device=x.device)
     n_ref, counter = refractory_tables(p.n_ref, refractory, dummy)
     unused = torch.zeros_like(p.E_syn.detach())  # Mg block tables when there is none
     return _Launch(
@@ -211,16 +249,25 @@ def _prepare(
         mg_lc=_pad(torch.log(p.mg_c) if p.mg_c is not None else unused, SP),
         # The kernels get the physiology detached (the autograd functions take it as
         # inputs): launching with tensors that require grad costs host time per launch.
-        p=replace(p, **{name: getattr(p, name).detach() for name in PHYSIOLOGY}),
+        p=replace(p, **{name: _detached(getattr(p, name)) for name in PHYSIOLOGY}),
         sample=sample, probabilities=probabilities,
         noise=torch.rand((B, T, N), device=x.device) if sample else dummy,
         track_b=(-1 if track_batch_idx is None else track_batch_idx) if track else 0,
         tracked=tracked, dummy=dummy,
-        wants=tuple(getattr(p, name).requires_grad for name in PHYSIOLOGY),
+        wants=tuple(_requires_grad(getattr(p, name)) for name in PHYSIOLOGY),
         recurrent_gradients=drive.recurrent_gradients,
         n_ref=n_ref, counter=counter,
         gating=gating_tables(drive, gating, dummy),
+        a_state=adaptation,
     )  # fmt: skip
+
+
+def _detached(t):
+    return None if t is None else t.detach()
+
+
+def _requires_grad(t) -> bool:
+    return t is not None and t.requires_grad
 
 
 def _neurons(p: Physiology):
@@ -228,26 +275,31 @@ def _neurons(p: Physiology):
 
 
 def _track_buffers(L: _Launch):
+    """The tracked ``v``, ``I``, ``g`` and adaptation buffers, or dummies."""
     if L.tracked is None:
-        return L.dummy, L.dummy, L.dummy
-    return L.tracked["v"], L.tracked["I"], L.tracked["g"]
+        return (L.dummy,) * 4
+    t = L.tracked
+    return t["v"], t["I"], t["g"], t.get("a", L.dummy)
 
 
 def _scan(L, A, scale, v, g, spikes, prob, saved, t0=0):
-    """``scan_forward`` over the ``A.shape[2]`` steps from ``t0``; updates v, g and the
-    refractory counters in place. ``saved`` is ``(v_saved, G_saved, held)``, or None."""
-    v_saved, G_saved, held = saved if saved else (L.dummy,) * 3
+    """``scan_forward`` over the ``A.shape[2]`` steps from ``t0``; updates v, g, the
+    refractory counters and the adaptation in place. ``saved`` is ``(v_saved,
+    G_saved, held, a_saved)``, or None."""
+    v_saved, G_saved, held, a_saved = saved if saved else (L.dummy,) * 4
+    track_v, track_I, track_g, track_a = _track_buffers(L)
     TA = A.shape[2]
     kernels.scan_forward[(triton.cdiv(L.B * L.N, BLOCK),)](
         A, scale, L.made, L.jump, L.decay, L.E_syn, L.g_clip, L.mg_a, L.mg_lc,
         *_neurons(L.p),
         v, g, spikes, L.dummy if prob is None else prob, L.noise, L.n_ref, L.counter,
-        v_saved, G_saved, held, *_track_buffers(L),
+        *L.adaptation(),
+        v_saved, G_saved, held, a_saved, track_v, track_I, track_g, track_a,
         L.p.dt, L.p.surr_scale, L.track_b, t0, TA, L.B, L.T, L.N,
         K=L.K, S=L.S, SP=L.SP, BLOCK=BLOCK,
         SAVE=bool(saved), TRACK=L.tracked is not None,
         PROB=prob is not None, SAMPLE=L.sample, REFRACTORY=L.refractory,
-        MG_BLOCK=L.mg_block,
+        MG_BLOCK=L.mg_block, ADAPT=L.adapting,
     )  # fmt: skip
 
 
@@ -258,11 +310,14 @@ def _recurrent(L, A_ff_blocks, W, w_offsets, rows, sizes, scale, v, g, spikes, s
     ``A_ff_blocks`` yields ``(t0, A_ff)`` blocks of feedforward activations in order;
     ``rows`` holds the recurrent pathways' source neurons back to back, ``sizes`` how
     many each has, and their weight rows begin at ``w_offsets`` of ``W``. ``saved`` is
-    ``(v_saved, G_saved, A_saved, held, f_saved)``, or None.
+    ``(v_saved, G_saved, A_saved, held, f_saved, a_saved)``, or None.
     """
     row_start = _row_start(sizes, v.device)
     w_start = offsets_tensor(w_offsets, v.device) if L.K_rec else row_start
-    v_saved, G_saved, A_saved, held, f_saved = saved if saved else (L.dummy,) * 5
+    v_saved, G_saved, A_saved, held, f_saved, a_saved = (
+        saved if saved else (L.dummy,) * 6
+    )
+    track_v, track_I, track_g, track_a = _track_buffers(L)
     W = W.to(L.p.storage_dtype)  # a copy if reduced: gradients stay float32
     capacity = max(sizes) if L.K_rec else 1
     lists = torch.empty(
@@ -288,19 +343,22 @@ def _recurrent(L, A_ff_blocks, W, w_offsets, rows, sizes, scale, v, g, spikes, s
             kernels.recurrent_step[(L.B, triton.cdiv(L.N, STEP_BLOCK))](
                 A_ff, W, w_start, lists, amps, counts, scale, L.made, L.jump, L.decay,
                 L.E_syn, L.g_clip, L.mg_a, L.mg_lc, *_neurons(L.p),
-                v, g, spikes, L.noise, L.n_ref, L.counter,
-                v_saved, G_saved, A_saved, held, *_track_buffers(L),
+                v, g, spikes, L.noise, L.n_ref, L.counter, *L.adaptation(),
+                v_saved, G_saved, A_saved, held, a_saved,
+                track_v, track_I, track_g, track_a,
                 dt, surr, L.track_b, t, i, L.T, T_ff, L.B, L.N, capacity,
                 K_REC=L.K_rec, K_FF=L.K_ff, S=L.S, SP=L.SP,
                 BLOCK=STEP_BLOCK, ROWS=GATHER_ROWS,
                 SAVE=bool(saved), TRACK=L.tracked is not None, SAMPLE=L.sample,
                 REFRACTORY=L.refractory, MG_BLOCK=L.mg_block, GATED=gates.gated,
+                ADAPT=L.adapting,
             )  # fmt: skip
 
 
-def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
+def _backward(L, saved, a_saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
     """``scan_backward``: returns ``(grad_A, grad_scale, *physiology)`` (None where
-    not wanted). ``saved`` is ``(spikes, v_saved, G_saved, g_init, held)``."""
+    not wanted). ``saved`` is ``(spikes, v_saved, G_saved, g_init, held)``, and
+    ``a_saved`` each step's adaptation (or a dummy)."""
     grad_A = torch.empty_like(A) if want_A else L.dummy
     partial = torch.empty((L.K, L.B, L.N), device=A.device) if want_scale else L.dummy
     physiology = _physiology_grads(L, A.device)
@@ -310,12 +368,13 @@ def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
         L.dummy if grad_prob is None else grad_prob.contiguous(),
         *saved, A, scale, L.made, L.jump, L.decay, L.E_syn, L.g_clip,
         L.mg_a, L.mg_lc,
-        L.p.theta, L.p.E_L, L.p.C_m, L.p.beta, grad_A, partial, *physiology,
+        L.p.theta, L.p.E_L, L.p.C_m, L.p.beta, *L.adaptation()[1:3], a_saved,
+        grad_A, partial, *physiology,
         L.p.dt, L.p.surr_scale, L.B, L.T, L.N,
         K=L.K, KP=triton.next_power_of_2(L.K), S=L.S, SP=L.SP, BLOCK=block,
         WANT_A=want_A, WANT_SCALE=want_scale, **L.flags(),
         PROB=grad_prob is not None, SAMPLE=L.sample, REFRACTORY=L.refractory,
-        MG_BLOCK=L.mg_block,
+        MG_BLOCK=L.mg_block, ADAPT=L.adapting,
     )  # fmt: skip
     return (
         grad_A if want_A else None,
@@ -325,17 +384,19 @@ def _backward(L, saved, A, scale, grad_spikes, grad_prob, want_A, want_scale):
 
 
 def _recurrent_backward(
-    L, saved, A, scale, W, w_offsets, rows, sizes, factors, grad_spikes, want_scale
-):
+    L, saved, a_saved, A, scale, W, w_offsets, rows, sizes, factors, grad_spikes,
+    want_scale,
+):  # fmt: skip
     """The reverse loop over steps, when gradients flow through the recurrent spikes:
     returns ``(grad_A, grad_scale, *physiology)``.
 
     ``grad_A`` ``(K, B, T, N)`` is always computed: its recurrent part is what reaches
     the presynaptic spikes (a presynaptic pathway's times its ``factors``).
     ``grad_scale`` and the physiology are None unless wanted. ``saved`` is
-    ``(spikes, v_saved, G_saved, g_init, held)``.
+    ``(spikes, v_saved, G_saved, g_init, held)``, ``a_saved`` as in ``_backward``.
     """
     spikes, v_saved, G_saved, g_init, held = saved
+    la = torch.zeros((L.B, L.N), device=A.device) if L.adapting else L.dummy
     block = L.backward_block()
     grid = (triton.cdiv(L.B * L.N, block),)
     lv = torch.zeros((L.B, L.N), device=A.device)
@@ -353,11 +414,12 @@ def _recurrent_backward(
     grad_spikes = grad_spikes.contiguous()
     for t in reversed(range(L.T)):
         kernels.inject_backward[grid](
-            lv, lg, H, spikes, v_saved, G_saved, held, A, scale, L.made, L.jump,
-            L.decay, L.E_syn, L.g_clip, L.mg_a, L.mg_lc, L.p.E_L, L.p.C_m, L.p.beta,
+            lv, lg, H, la, spikes, v_saved, G_saved, held, a_saved, A, scale, L.made,
+            L.jump, L.decay, L.E_syn, L.g_clip, L.mg_a, L.mg_lc, L.p.E_L, L.p.C_m,
+            L.p.beta, *L.adaptation()[1:3],
             grad_A, partial, *rest, L.p.dt, t, L.B, L.T, L.N,
             K=L.K, S=L.S, SP=L.SP, BLOCK=block, WANT_SCALE=want_scale, **flags,
-            REFRACTORY=L.refractory, MG_BLOCK=L.mg_block,
+            REFRACTORY=L.refractory, MG_BLOCK=L.mg_block, ADAPT=L.adapting,
         )  # fmt: skip
         carry_to_sources(R, blocks, grad_A[:, :, t], factors, t, shared)
         kernels.spike_backward[grid](
@@ -392,20 +454,21 @@ class _FeedforwardScan(torch.autograd.Function):
             (L.B, L.T, L.N, L.S), device=A.device, dtype=L.p.storage_dtype
         )
         held = L.held()
+        a_saved = L.a_saved()
         g_init = L.g_init(g)
-        _scan(L, A, scale, v, g, spikes, prob, (v_saved, G_saved, held))
+        _scan(L, A, scale, v, g, spikes, prob, (v_saved, G_saved, held, a_saved))
         ctx.L = L
-        ctx.save_for_backward(A, scale, spikes, v_saved, G_saved, g_init, held)
+        ctx.save_for_backward(A, scale, spikes, v_saved, G_saved, g_init, held, a_saved)
         ctx.mark_non_differentiable(v, g)
         return spikes, prob, v, g
 
     @staticmethod
     def backward(ctx, grad_spikes, grad_prob, _v, _g):
-        A, scale, *saved = ctx.saved_tensors
+        A, scale, *saved, a_saved = ctx.saved_tensors
         if grad_spikes is None:
             grad_spikes = torch.zeros_like(saved[0])
         grad_A, grad_scale, *physiology = _backward(
-            ctx.L, saved, A, scale, grad_spikes, grad_prob,
+            ctx.L, saved, a_saved, A, scale, grad_spikes, grad_prob,
             want_A=ctx.needs_input_grad[0], want_scale=ctx.needs_input_grad[1],
         )  # fmt: skip
         return grad_A, grad_scale, None, None, None, *physiology
@@ -427,26 +490,29 @@ class _RecurrentRun(torch.autograd.Function):
         A_rec = torch.empty((L.K_rec, L.B, L.T, L.N), device=A_ff.device)
         held = L.held()
         f_saved = L.gating.f_saved(L.B, L.T, L.dummy)
+        a_saved = L.a_saved()
         g_init = L.g_init(g)
         _recurrent(
             L, [(0, A_ff)], W, w_offsets, rows, sizes, scale, v, g, spikes,
-            (v_saved, G_saved, A_rec, held, f_saved),
+            (v_saved, G_saved, A_rec, held, f_saved, a_saved),
         )  # fmt: skip
         ctx.L, ctx.w_offsets, ctx.rows, ctx.sizes = L, w_offsets, rows, sizes
         ctx.n_weights = W.shape[0]
         # W is needed only to carry gradients through the recurrent spikes.
         kept = W if L.recurrent_gradients else L.dummy
         ctx.save_for_backward(
-            A_ff, scale, kept, spikes, v_saved, G_saved, A_rec, g_init, held, f_saved
-        )
+            A_ff, scale, kept, spikes, v_saved, G_saved, A_rec, g_init, held, f_saved,
+            a_saved,
+        )  # fmt: skip
         ctx.mark_non_differentiable(v, g)
         return spikes, v, g
 
     @staticmethod
     def backward(ctx, grad_spikes, _v, _g):
-        A_ff, scale, W, spikes, v_saved, G_saved, A_rec, g_init, held, f_saved = (
-            ctx.saved_tensors
-        )
+        (
+            A_ff, scale, W, spikes, v_saved, G_saved, A_rec, g_init, held, f_saved,
+            a_saved,
+        ) = ctx.saved_tensors  # fmt: skip
         L, w_offsets, rows, sizes = ctx.L, ctx.w_offsets, ctx.rows, ctx.sizes
         factors = L.gating.factors(f_saved, sizes)
         want_ff, want_scale, want_W = ctx.needs_input_grad[:3]
@@ -456,12 +522,12 @@ class _RecurrentRun(torch.autograd.Function):
         saved = (spikes, v_saved, G_saved, g_init, held)
         if L.recurrent_gradients:
             grad_A, grad_scale, *physiology = _recurrent_backward(
-                L, saved, A, scale, W, w_offsets, rows, sizes, factors, grad_spikes,
-                want_scale,
+                L, saved, a_saved, A, scale, W, w_offsets, rows, sizes, factors,
+                grad_spikes, want_scale,
             )  # fmt: skip
         else:  # the recurrent activations are input like any other: one reverse scan
             grad_A, grad_scale, *physiology = _backward(
-                L, saved, A, scale, grad_spikes, None,
+                L, saved, a_saved, A, scale, grad_spikes, None,
                 want_A=want_ff or want_W, want_scale=want_scale,
             )  # fmt: skip
         grad_W = (
@@ -484,13 +550,21 @@ class _RecurrentRun(torch.autograd.Function):
 
 
 def _simulate_kernels(
-    v, g, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
-) -> Run:
+    v, g, x, drive, p, refractory, gating, adaptation, probabilities, track,
+    track_batch_idx,
+) -> Run:  # fmt: skip
     if gating is not None:  # updated in place by the kernels
         gating = gating.detach().float().contiguous().clone()
+    if p.adapt is not None:  # likewise
+        adaptation = (
+            torch.zeros_like(v, dtype=torch.float32)
+            if adaptation is None
+            else adaptation.detach().float().contiguous().clone()
+        )
     L = _prepare(
-        v, x, drive, p, refractory, gating, probabilities, track, track_batch_idx
-    )
+        v, x, drive, p, refractory, gating, adaptation, probabilities, track,
+        track_batch_idx,
+    )  # fmt: skip
     counter = L.counter if L.refractory else refractory
     v = v.detach().float().contiguous().clone()
     # Conductances are stored (B, 2, S, N), so each component is contiguous over neurons,
@@ -516,7 +590,7 @@ def _simulate_kernels(
 
     def run(spikes, prob=None):
         state = g.permute(0, 3, 1, 2).float()
-        return Run(spikes, v, state, prob, L.tracked, counter, gating)
+        return Run(spikes, v, state, prob, L.tracked, counter, gating, adaptation)
 
     if L.K_rec == 0:
         if grad:

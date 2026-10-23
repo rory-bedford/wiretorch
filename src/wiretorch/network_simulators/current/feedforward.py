@@ -176,6 +176,7 @@ class FeedforwardCurrentLIFNetwork(CurrentNetwork):
             out = {
                 "spikes": run.spikes,
                 "voltages": run.tracked["v"],
+                **({"adaptation": run.tracked["a"]} if "a" in run.tracked else {}),
                 "currents_syn": run.tracked["I"],
             }
             if self.return_probabilities:

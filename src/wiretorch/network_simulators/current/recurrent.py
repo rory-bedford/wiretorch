@@ -254,6 +254,7 @@ class CurrentLIFNetwork(CurrentNetwork):
         return {
             "spikes": run.spikes,
             "voltages": run.tracked["v"],
+            **({"adaptation": run.tracked["a"]} if "a" in run.tracked else {}),
             "currents": I,
             "currents_syn_recurrent": self._side_currents(I, 0),
             "currents_syn_feedforward": self._side_currents(I, 1),

@@ -120,6 +120,7 @@ class FeedforwardConductanceLIFNetwork(ConductanceNetwork):
             out = {
                 "spikes": run.spikes,
                 "voltages": run.tracked["v"],
+                **({"adaptation": run.tracked["a"]} if "a" in run.tracked else {}),
                 "currents_feedforward": run.tracked["I"][..., :S],
                 "currents_leak": run.tracked["I"][..., S],
                 "conductances_feedforward": run.tracked["g"],

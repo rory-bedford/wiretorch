@@ -325,7 +325,8 @@ class Run:
     ``output`` is the network's output per step, ``(B, T, N)``: spikes, or rates for a
     rate network. ``v`` and ``syn`` are the state after the last step, and for a
     spiking network ``refractory`` the steps of refractory period each neuron has left,
-    and ``gating`` the saturating pathways' gating state (None if there are none).
+    ``gating`` the presynaptic pathways' state (None if there are none), and
+    ``adaptation`` each neuron's adaptation (None if none adapts).
     ``tracked`` (if tracking) holds per-step variables of the tracked trial(s), named by
     the family's dynamics.
     """
@@ -337,6 +338,7 @@ class Run:
     tracked: dict[str, torch.Tensor] | None = None
     refractory: torch.Tensor | None = None
     gating: torch.Tensor | None = None
+    adaptation: torch.Tensor | None = None
 
     @property
     def spikes(self) -> torch.Tensor:
@@ -376,6 +378,9 @@ class ProjectionNetwork(nn.Module):
     has_refractory = False
     #: Whether any neuron's refractory period is at least one step.
     _refractory = False
+    #: Whether any neuron adapts (``adapt > 0``): its state then also holds, per
+    #: neuron, its adaptation conductance or current (``adaptation``).
+    _adapting = False
 
     def __init__(
         self,
@@ -521,6 +526,29 @@ class ProjectionNetwork(nn.Module):
         tau_ref = self._per_neuron("tau_ref", 0.0)
         assert (tau_ref >= 0).all(), "cell_params: tau_ref must be >= 0"
         self.register_buffer("tau_ref", tau_ref, persistent=False)
+
+    def _register_adaptation(self, **defaults: float) -> None:
+        """Spike-frequency adaptation, per cell type: ``adapt``, its increase at each of
+        the neuron's spikes (default 0: none), ``tau_adapt`` (ms, default 100), the
+        time constant it decays with, and the family's ``defaults`` (such as
+        ``E_adapt``). Not saved with the module: from the cell parameters."""
+        adapt = self._per_neuron("adapt", 0.0)
+        tau = self._per_neuron("tau_adapt", 100.0)
+        assert (adapt >= 0).all(), "cell_params: adapt must be >= 0"
+        assert (tau[adapt > 0] > 0).all(), "cell_params: tau_adapt must be > 0"
+        self.register_buffer("adapt", adapt, persistent=False)
+        self.register_buffer("tau_adapt", tau, persistent=False)
+        for name, default in defaults.items():
+            self.register_buffer(
+                name, self._per_neuron(name, default), persistent=False
+            )
+        self._adapting = bool(adapt.any())
+
+    def _set_adaptation(self) -> None:
+        """``adapt_decay``, the adaptation's per-step decay ``exp(-dt / tau_adapt)``."""
+        self.register_buffer(
+            "adapt_decay", torch.exp(-self.dt / self.tau_adapt), persistent=False
+        )
 
     def _set_refractory(self) -> None:
         """``n_ref``, each neuron's refractory period in steps: ``tau_ref / dt``,
@@ -873,6 +901,7 @@ class ProjectionNetwork(nn.Module):
             self._physiology(),
             **({"refractory": self.refractory} if self.has_refractory else {}),
             **({"gating": self.gating} if self.n_gating else {}),
+            **({"adaptation": self.adaptation} if self._adapting else {}),
             probabilities=probabilities,
             track=self.track_variables,
             track_batch_idx=self.track_batch_idx,
@@ -887,6 +916,8 @@ class ProjectionNetwork(nn.Module):
             self.refractory = run.refractory
         if run.gating is not None:
             self.gating = run.gating
+        if run.adaptation is not None:
+            self.adaptation = run.adaptation.detach()
         return run
 
     def _validate_forward(self, input_spikes: torch.Tensor) -> None:
@@ -930,13 +961,17 @@ class ProjectionNetwork(nn.Module):
                 (self.batch_size, self.n_neurons), dtype=torch.int32, device=self.device
             )
             self.register_buffer("refractory", counter, persistent=False)
+            adaptation = torch.zeros(
+                (self.batch_size, self.n_neurons), device=self.device
+            )
+            self.register_buffer("adaptation", adaptation, persistent=False)
         gating = self._gating_rest.expand(self.batch_size, -1).clone()
         self.register_buffer("gating", gating, persistent=False)
 
     def get_checkpoint_state(self) -> dict[str, np.ndarray]:
         """The state; the refractory counters only if a neuron has a refractory period
         (they are zero otherwise), the gating state only if a pathway has presynaptic
-        dynamics."""
+        dynamics, the adaptation only if a neuron adapts."""
         state = {
             "v": self.v.cpu().numpy(),
             self.state_name: self._synaptic.cpu().numpy(),
@@ -945,6 +980,8 @@ class ProjectionNetwork(nn.Module):
             state["refractory"] = self.refractory.cpu().numpy()
         if self.n_gating:
             state["gating"] = self.gating.cpu().numpy()
+        if self._adapting:
+            state["adaptation"] = self.adaptation.cpu().numpy()
         return state
 
     def load_checkpoint_state(self, state: dict[str, np.ndarray]) -> None:
@@ -955,6 +992,11 @@ class ProjectionNetwork(nn.Module):
                 torch.from_numpy(state["refractory"]).to(self.device)
                 if "refractory" in state
                 else torch.zeros_like(self.v, dtype=torch.int32)
+            )
+            self.adaptation = (
+                torch.from_numpy(state["adaptation"]).to(self.device)
+                if "adaptation" in state
+                else torch.zeros_like(self.v)
             )
         self.gating = (
             torch.from_numpy(state["gating"]).to(self.device)

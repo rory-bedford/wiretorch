@@ -36,6 +36,11 @@ The release notes of each version on GitHub are taken from its section here.
   presets. A spike's input is its release over `U`, so a first spike from rest keeps its
   weight. Release drives a saturating synapse type's receptors. Triton kernels for every
   path.
+- Spike-frequency adaptation in both spiking families: a cell type's `adapt` (rise per
+  spike) and `tau_adapt` give its neurons a slow, spike-triggered inhibitory
+  conductance by `E_adapt` (conductance-based) or current (current-based). Part of the
+  state and the checkpoints, tracked as `adaptation`; `adapt`, `tau_adapt` and
+  `E_adapt` can be learnt. Triton kernels for every path.
 
 ## [0.1.0b1] - 2026-10-22
 

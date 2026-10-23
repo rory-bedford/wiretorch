@@ -33,9 +33,12 @@ from wiretorch.network_simulators.network import (  # noqa: F401 - re-exported
 
 #: What ``learn`` can train per cell type and per synapse type, and which stay
 #: positive (learnt as logarithms).
-LEARNABLE = {"tau_mem": None, "theta": None, "U_reset": None, "E_L": None, "g_L": None}
+LEARNABLE = {
+    "tau_mem": None, "theta": None, "U_reset": None, "E_L": None, "g_L": None,
+    "adapt": 0.0, "tau_adapt": 100.0, "E_adapt": -90.0,
+}  # fmt: skip
 LEARNABLE_SYNAPSE = ("tau_rise", "tau_decay", "E_syn", "g_bar")
-POSITIVE = {"tau_mem", "g_L", "tau_rise", "tau_decay", "g_bar"}
+POSITIVE = {"tau_mem", "g_L", "tau_rise", "tau_decay", "g_bar", "adapt", "tau_adapt"}
 
 
 class ConductanceNetwork(ProjectionNetwork):
@@ -48,7 +51,7 @@ class ConductanceNetwork(ProjectionNetwork):
 
     The physiology is fixed per-neuron and per-synapse buffers unless ``learn`` makes
     some of it trainable, per cell type (``tau_mem``, ``theta``, ``U_reset``, ``E_L``,
-    ``g_L``) or synapse type (``tau_rise``, ``tau_decay``, ``E_syn``, ``g_bar``), for
+    ``g_L``, and the adaptation's ``adapt``, ``tau_adapt``, ``E_adapt``) or synapse type (``tau_rise``, ``tau_decay``, ``E_syn``, ``g_bar``), for
     every type (``True``) or the types named:
 
         learn={"tau_mem": True, "theta": ["E"], "tau_decay": ["GABA_A"]}
@@ -140,6 +143,8 @@ class ConductanceNetwork(ProjectionNetwork):
             "saturation", saturation_table(self.registry), persistent=False
         )
         self._register_refractory()
+        # Spike-frequency adaptation: a potassium-like conductance, by E_adapt (mV).
+        self._register_adaptation(E_adapt=-90.0)
         self.register_buffer(
             "surrgrad_scale", torch.tensor(self._surrgrad_scale, dtype=torch.float32)
         )
@@ -197,6 +202,7 @@ class ConductanceNetwork(ProjectionNetwork):
         # The saturating types' gating variables decay as their conductances do.
         self.register_buffer("_gate_decay", self.alpha[1].clone(), persistent=False)
         self._set_refractory()
+        self._set_adaptation()
 
     def _kernel(self, tau_rise, tau_decay, g_bar) -> torch.Tensor:
         return conductance_kernel(tau_rise, tau_decay, g_bar, self.saturation > 0)
@@ -228,6 +234,15 @@ class ConductanceNetwork(ProjectionNetwork):
             n_ref=self.n_ref if self._refractory else None,
             mg_c=self.mg_c if self._mg_block else None,
             mg_a=self.mg_a if self._mg_block else None,
+            **(
+                dict(
+                    adapt=learnt("adapt", self.adapt),
+                    adapt_decay=learnt("tau_adapt", self.adapt_decay, decay=True),
+                    E_adapt=learnt("E_adapt", self.E_adapt),
+                )
+                if self._adapting
+                else {}
+            ),
         )
 
     def _initial_state(self) -> tuple[torch.Tensor, torch.Tensor]:

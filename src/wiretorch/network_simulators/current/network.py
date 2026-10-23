@@ -35,9 +35,11 @@ LEARNABLE = {
     "U_reset": U_RESET,
     "U_rest": U_REST,
     "R": R,
+    "adapt": 0.0,
+    "tau_adapt": 100.0,
 }
 LEARNABLE_SYNAPSE = ("tau_syn",)
-POSITIVE = {"tau_mem", "R", "tau_syn"}
+POSITIVE = {"tau_mem", "R", "tau_syn", "adapt", "tau_adapt"}
 
 
 class CurrentNetwork(ProjectionNetwork):
@@ -124,6 +126,7 @@ class CurrentNetwork(ProjectionNetwork):
         self.register_buffer("U_rest", self._per_neuron("U_rest", U_REST))
         self.register_buffer("R", self._per_neuron("R", R))
         self._register_refractory()
+        self._register_adaptation()  # a current, subtracted from the input
         self.register_buffer("tau_syn", self.registry.table("tau_syn"))
         self.register_buffer(
             "sign",
@@ -144,6 +147,7 @@ class CurrentNetwork(ProjectionNetwork):
         self.register_buffer("alpha", torch.exp(-self.dt / self.tau_syn))
         self.register_buffer("beta", torch.exp(-self.dt / self.tau_mem))
         self._set_refractory()
+        self._set_adaptation()
 
     def _physiology(self) -> Physiology:
         learnt = self._learnt
@@ -159,6 +163,14 @@ class CurrentNetwork(ProjectionNetwork):
             spike_mode=self.spike_mode,
             storage_dtype=self.storage_dtype,
             n_ref=self.n_ref if self._refractory else None,
+            **(
+                dict(
+                    adapt=learnt("adapt", self.adapt),
+                    adapt_decay=learnt("tau_adapt", self.adapt_decay, decay=True),
+                )
+                if self._adapting
+                else {}
+            ),
         )
 
     def _initial_state(self) -> tuple[torch.Tensor, torch.Tensor]:

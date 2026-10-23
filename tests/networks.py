@@ -142,6 +142,19 @@ def stp_pairs(sources, recurrent_names=("excitatory", "inhibitory")):
     return pairs
 
 
+def adapting(cells, adapt, tau_adapt=200.0):
+    """``cells`` whose excitatory type adapts by ``adapt`` per spike (unchanged if
+    None)."""
+    if adapt is None:
+        return cells
+    return [
+        {**c, "adapt": adapt, "tau_adapt": tau_adapt}
+        if c["name"] == "excitatory"
+        else c
+        for c in cells
+    ]
+
+
 def refractory(cells, tau_ref):
     """``cells`` with a refractory period of ``tau_ref`` ms (unchanged if None)."""
     return cells if tau_ref is None else [{**c, "tau_ref": tau_ref} for c in cells]
@@ -274,13 +287,14 @@ def recurrent(
     mg=None,
     saturation=None,
     stp=False,
+    adapt=None,
 ):
     """``ConductanceLIFNetwork`` with frozen weights or perturbed scaling factors, and
     the physiology ``learn`` names; ``learnt_weights`` makes the recurrent weights
     full-rank parameters (and the feedforward ones scaling factors), ``tau_ref`` (ms)
     gives every cell type a refractory period, ``mg`` (mM) the NMDA types a Mg block,
     ``saturation`` makes them saturate; ``stp`` gives the excitatory and input sources
-    short-term plasticity (``stp_pairs``)."""
+    short-term plasticity (``stp_pairs``), ``adapt`` the excitatory cells adaptation."""
     rng, types, w_rec, w_ff = _structure(seed, n, n_ff)
     ff_types = np.zeros(n_ff, dtype=np.int64)
     if learnt_weights:
@@ -319,7 +333,7 @@ def recurrent(
         ff_projections=ff,
         cell_type_indices=types,
         cell_type_indices_FF=ff_types,
-        cell_params=refractory(CELLS, tau_ref),
+        cell_params=adapting(refractory(CELLS, tau_ref), adapt),
         cell_params_FF=MITRAL_CELLS,
         synapse_params=saturating(mg_block(SYNAPSES, mg), saturation),
         synapse_params_FF=saturating(mg_block(MITRAL_SYNAPSES, mg), saturation),
@@ -355,12 +369,14 @@ def feedforward(
     mg=None,
     saturation=None,
     stp=False,
+    adapt=None,
 ):
     """``FeedforwardConductanceLIFNetwork`` whose input rows are the external inputs and a
     ``recurrent`` network's neurons (as in teacher forcing), learning the physiology
     ``learn`` names, with a refractory period of ``tau_ref`` ms, a Mg block of ``mg``
     mM on the NMDA types and their ``saturation`` if given, and with ``stp`` short-term
-    plasticity from the inputs and the excitatory rows (``stp_pairs``).
+    plasticity from the inputs and the excitatory rows (``stp_pairs``), and ``adapt``
+    the excitatory cells adaptation.
 
     Scaling factors on every pathway, or (``learnt_weights``) full-rank mitral, low-rank
     excitatory and scaling-factor inhibitory pathways — one of each caching mode.
@@ -397,7 +413,7 @@ def feedforward(
         projections=projections,
         cell_type_indices=types,
         cell_type_indices_FF=row_types,
-        cell_params=refractory(CELLS, tau_ref),
+        cell_params=adapting(refractory(CELLS, tau_ref), adapt),
         cell_params_FF=cells,
         synapse_params_FF=synapses,
         surrgrad_scale=5.0,
@@ -537,6 +553,7 @@ def current_recurrent(
     learn=None,
     tau_ref=None,
     stp=False,
+    adapt=None,
 ):
     """``CurrentLIFNetwork`` with learnt scaling factors (or ``optimisable`` weights),
     the physiology ``learn`` names, and a refractory period of ``tau_ref`` ms if given.
@@ -567,7 +584,7 @@ def current_recurrent(
         weights_FF=w_ff,
         cell_type_indices=types,
         cell_type_indices_FF=np.zeros(n_ff, dtype=np.int64),
-        cell_params=refractory(CURRENT_CELLS, tau_ref),
+        cell_params=adapting(refractory(CURRENT_CELLS, tau_ref), adapt),
         synapse_params=CURRENT_SYNAPSES,
         synapse_params_FF=CURRENT_SYNAPSES_FF,
         surrgrad_scale=5.0,
@@ -639,7 +656,7 @@ CURRENT_RATE_HZ = {E: 11.0, I: 7.0}  # the current_recurrent regime's rates
 
 
 def current_feedforward_probabilities(
-    batch_size, seed, learn=None, tau_ref=None, stp=False
+    batch_size, seed, learn=None, tau_ref=None, stp=False, adapt=None
 ):
     """``FeedforwardCurrentLIFNetwork`` returning spike probabilities (and learning the
     physiology ``learn`` names, with a refractory period of ``tau_ref`` ms if given).
@@ -668,7 +685,7 @@ def current_feedforward_probabilities(
         projections=projections,
         cell_type_indices=types,
         cell_type_indices_FF=row_types,
-        cell_params=refractory(CURRENT_CELLS, tau_ref),
+        cell_params=adapting(refractory(CURRENT_CELLS, tau_ref), adapt),
         cell_params_FF=CURRENT_INPUT_CELLS,
         synapse_params_FF=CURRENT_INPUT_SYNAPSES,
         surrgrad_scale=5.0,

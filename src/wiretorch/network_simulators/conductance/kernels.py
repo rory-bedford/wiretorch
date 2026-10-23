@@ -80,20 +80,25 @@ def _mg_block(v, mg_a, mg_lc):
 
 @triton.jit
 def _membrane(
-    v, s, gr, gd, U_reset, E_L, g_L, inv_C, rate, E_syn, g_clip, mg_a, mg_lc, dt,
-    MG_BLOCK: tl.constexpr,
+    v, s, gr, gd, U_reset, E_L, g_L, inv_C, rate, E_syn, g_clip, mg_a, mg_lc,
+    g_a, E_a, dt, MG_BLOCK: tl.constexpr, ADAPT: tl.constexpr,
 ):  # fmt: skip
     """Synaptic and leak currents, and the voltage after the step (with reset): the
     exponential-Euler step of ``dynamics.membrane``. ``g_L``, ``inv_C``, ``rate``
-    from ``_leak``."""
+    from ``_leak``; with ``ADAPT`` the adaptation conductance ``g_a`` by ``E_a``."""
     G = gr + gd
     Gc = tl.minimum(tl.maximum(G, 0.0), g_clip[None, :])
     if MG_BLOCK:
         Gc = Gc * _mg_block(v, mg_a, mg_lc)
     I = Gc * (v[:, None] - E_syn[None, :])
-    _, phi, _ = _relaxation(tl.sum(Gc, axis=1), g_L, inv_C, rate, dt)
     I_leak = g_L * (v - E_L)
-    v_next = (v - phi * (tl.sum(I, axis=1) + I_leak)) * (1 - s) + U_reset * s
+    S = tl.sum(Gc, axis=1)
+    J = tl.sum(I, axis=1) + I_leak
+    if ADAPT:
+        S += g_a
+        J += g_a * (v - E_a)
+    _, phi, _ = _relaxation(S, g_L, inv_C, rate, dt)
+    v_next = (v - phi * J) * (1 - s) + U_reset * s
     return G, I, I_leak, v_next
 
 
@@ -140,15 +145,24 @@ def _track(
 
 
 @triton.jit
+def _track_adaptation(track_a, b, n, t, T, N, live, g_a, track_b):
+    """Write the adaptation after the step, for the tracked trial(s)."""
+    tracked = live & ((track_b < 0) | (b == track_b))
+    bt = tl.where(track_b < 0, b, 0)
+    tl.store(track_a + (bt * T + t) * N + n, g_a, mask=tracked)
+
+
+@triton.jit
 def scan_forward(
     A, scale, made, jump, decay, E_syn, g_clip, mg_a, mg_lc,
     theta, U_reset, E_L, C_m, beta,
     v_state, g_state, spikes, prob, noise, n_ref, counter,
-    v_saved, G_saved, held_saved, track_v, track_I, track_g,
+    adapt, adapt_decay, E_adapt, a_state,
+    v_saved, G_saved, held_saved, a_saved, track_v, track_I, track_g, track_a,
     dt_ptr, surr_ptr, track_b, t0, TA, B, T, N,
     K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
     SAVE: tl.constexpr, TRACK: tl.constexpr, PROB: tl.constexpr, SAMPLE: tl.constexpr,
-    REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr,
+    REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr, ADAPT: tl.constexpr,
 ):  # fmt: skip
     """Integrate steps ``t0 .. t0 + TA`` of a ``T``-step chunk.
 
@@ -156,7 +170,10 @@ def scan_forward(
     be fed in blocks; outputs are indexed by the step within the whole chunk. With
     ``REFRACTORY``, ``counter`` ``(B, N)`` int32 holds the steps of refractory period
     left (``n_ref`` ``(N,)`` int32 the periods), and ``held_saved`` ``(B, T, N)`` int8
-    gets which neurons were refractory, for the backward pass.
+    gets which neurons were refractory, for the backward pass. With ``ADAPT``,
+    ``a_state`` ``(B, N)`` holds the adaptation conductances (updated in place; per
+    neuron ``adapt``, ``adapt_decay``, ``E_adapt``), and ``a_saved`` ``(B, T, N)`` gets
+    each step's, for the backward pass.
     """
     dt = tl.load(dt_ptr)  # scalars read on the device: no host sync to pass them
     surr_scale = tl.load(surr_ptr)
@@ -185,6 +202,14 @@ def scan_forward(
     if REFRACTORY:
         n_ref_n = tl.load(n_ref + n, mask=live, other=0)
         c = tl.load(counter + idx, mask=live, other=0)
+    if ADAPT:
+        g_a = tl.load(a_state + idx, mask=live, other=0.0)
+        a_jump = tl.load(adapt + n, mask=live, other=0.0)
+        a_decay = tl.load(adapt_decay + n, mask=live, other=0.0)
+        E_a = tl.load(E_adapt + n, mask=live, other=0.0)
+    else:
+        g_a = 0.0
+        E_a = 0.0
 
     for i in range(TA):
         t = t0 + i
@@ -217,14 +242,21 @@ def scan_forward(
             clip,
             mga,
             mglc,
+            g_a,
+            E_a,
             dt,
             MG_BLOCK,
+            ADAPT,
         )
         if SAVE:
             tl.store(v_saved + out, v, mask=live)
             tl.store(G_saved + out[:, None] * S + j[None, :], G, mask=sm)
             if REFRACTORY:
                 tl.store(held_saved + out, held.to(tl.int8), mask=live)
+            if ADAPT:
+                tl.store(a_saved + out, g_a, mask=live)
+        if ADAPT:  # the neuron's own spike raises it
+            g_a = g_a * a_decay + a_jump * s
 
         gr = gr * decay_r[None, :]
         gd = gd * decay_d[None, :]
@@ -242,12 +274,16 @@ def scan_forward(
                 track_v, track_I, track_g, b, n, t, T, N, j, live,
                 v, I, I_leak, gr, gd, track_b, S,
             )  # fmt: skip
+            if ADAPT:
+                _track_adaptation(track_a, b, n, t, T, N, live, g_a, track_b)
 
     tl.store(v_state + idx, v, mask=live)
     tl.store(g_row, gr, mask=sm)
     tl.store(g_row + S * N, gd, mask=sm)
     if REFRACTORY:
         tl.store(counter + idx, c, mask=live)
+    if ADAPT:
+        tl.store(a_state + idx, g_a, mask=live)
 
 
 @triton.jit
@@ -274,18 +310,22 @@ def _injection(A, scale, made, stride, out, n, j, live, N, K: tl.constexpr,
 
 @triton.jit
 def _membrane_adjoint(
-    dv, s, v, G, E, clip, mg_a, mg_lc, E_L, C_m, beta, rate, g_L, inv_C, dt,
-    acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E,
+    dv, s, v, G, E, clip, mg_a, mg_lc, E_L, C_m, beta, rate, g_L, inv_C, g_a, E_a, dt,
+    acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E, acc_E_a,
     WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr, WANT_BETA: tl.constexpr,
     WANT_C_M: tl.constexpr, WANT_E_SYN: tl.constexpr, MG_BLOCK: tl.constexpr,
+    ADAPT: tl.constexpr, WANT_E_ADAPT: tl.constexpr,
 ):  # fmt: skip
     """Step ``dv`` (dL/dv after the step) back through the membrane update
     ``v_next = (v - phi J) (1 - s) + U s`` of ``_membrane``: ``J = I_leak + sum_j I_j``,
     ``phi = (1 - a) / g_tot``, ``a = beta exp(-dt S / C)``, ``g_tot = g_L + S``,
     ``S = sum_j G_j`` (the conductances, clipped and blocked), ``g_L = -C log(beta) / dt``.
 
+    With ``ADAPT`` the adaptation conductance ``g_a`` by ``E_a`` is one more term of
+    ``S`` and ``J``.
+
     Returns dL/dv entering the step (without its spike term), dL/dG of the summed
-    conductances it read, and the accumulators with this step's terms added.
+    conductances it read, the accumulators with this step's terms added, and dL/dg_a.
     """
     Gc = tl.minimum(tl.maximum(G, 0.0), clip[None, :])
     gx = dv * (1 - s)
@@ -297,8 +337,11 @@ def _membrane_adjoint(
     else:
         G_eff = Gc
     S = tl.sum(G_eff, axis=1)
-    a, phi, inv_g = _relaxation(S, g_L, inv_C, rate, dt)
     J = g_L * (v - E_L) + v * S - tl.sum(G_eff * E[None, :], axis=1)
+    if ADAPT:
+        S += g_a
+        J += g_a * (v - E_a)
+    a, phi, inv_g = _relaxation(S, g_L, inv_C, rate, dt)
     # dL/dG_j of each (blocked) conductance, through J and through phi (via S):
     # -gx (phi_S J + phi (v - E_j)), from per-neuron scalars.
     phi_S = (a * dt * inv_C - phi) * inv_g
@@ -327,23 +370,27 @@ def _membrane_adjoint(
         acc_beta -= gx * (dphi * J + phi * g_v * dg_L)
     if WANT_E_SYN:
         acc_E += gx[:, None] * phi[:, None] * G_eff
-    return dv_in, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E
+    d_ga = k0 + k1 * E_a  # as a synapse type's, by E_a
+    if WANT_E_ADAPT:
+        acc_E_a += gx * phi * g_a
+    return dv_in, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E, acc_E_a, d_ga
 
 
 @triton.jit
 def scan_backward(
     grad_spikes, grad_prob, spikes, v_saved, G_saved, g_init, held_saved, A, scale,
-    made, jump, decay, E_syn, g_clip, mg_a, mg_lc, theta, E_L, C_m, beta, grad_A,
-    grad_scale,
+    made, jump, decay, E_syn, g_clip, mg_a, mg_lc, theta, E_L, C_m, beta,
+    adapt_decay, E_adapt, a_saved, grad_A, grad_scale,
     grad_theta, grad_reset, grad_E_L, grad_C_m, grad_beta, grad_E_syn, grad_decay,
-    grad_jump, dt_ptr, surr_ptr, B, T, N,
+    grad_jump, grad_adapt, grad_adapt_decay, grad_E_adapt, dt_ptr, surr_ptr, B, T, N,
     K: tl.constexpr, KP: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, WANT_A: tl.constexpr, WANT_SCALE: tl.constexpr,
     WANT_THETA: tl.constexpr, WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr,
     WANT_C_M: tl.constexpr, WANT_BETA: tl.constexpr, WANT_E_SYN: tl.constexpr,
-    WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr,
+    WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr, WANT_ADAPT: tl.constexpr,
+    WANT_ADAPT_DECAY: tl.constexpr, WANT_E_ADAPT: tl.constexpr,
     PROB: tl.constexpr, SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
-    MG_BLOCK: tl.constexpr,
+    MG_BLOCK: tl.constexpr, ADAPT: tl.constexpr,
 ):  # fmt: skip
     """Backpropagate through ``T`` steps: the adjoint of ``scan_forward``.
 
@@ -353,7 +400,10 @@ def scan_backward(
     physiology wanted. ``g_init`` (B, 2, S, N) holds the conductances entering the
     chunk (read only for the decays).
     ``held_saved`` (B, T, N) int8 marks the refractory steps (with ``REFRACTORY``),
-    where the voltage is held at reset and the spike at zero.
+    where the voltage is held at reset and the spike at zero. With ``ADAPT``,
+    ``a_saved`` (B, T, N) holds each step's adaptation conductance, whose adjoint is
+    carried back too: the adaptation's rise per spike, decay and ``E_adapt`` get their
+    gradients from it.
     """
     dt = tl.load(dt_ptr)
     surr_scale = tl.load(surr_ptr)
@@ -364,6 +414,15 @@ def scan_backward(
     j = tl.arange(0, SP)
     sm = live[:, None] & (j[None, :] < S)
     kk = tl.arange(0, KP)
+    la = tl.zeros((BLOCK,), dtype=tl.float32)  # dL/dg_a entering the next step
+    acc_adapt = tl.zeros((BLOCK,), dtype=tl.float32)
+    acc_adapt_decay = tl.zeros((BLOCK,), dtype=tl.float32)
+    acc_E_a = tl.zeros((BLOCK,), dtype=tl.float32)
+    if ADAPT:
+        a_decay = tl.load(adapt_decay + n, mask=live, other=0.0)
+        E_a = tl.load(E_adapt + n, mask=live, other=0.0)
+    else:
+        E_a = 0.0
 
     theta_n = tl.load(theta + n, mask=live)
     E_L_n = tl.load(E_L + n, mask=live)
@@ -433,12 +492,26 @@ def scan_backward(
                 a = tl.load(A + k * (B * T * N) + out, mask=live, other=0.0)
                 acc += tl.where(kk[None, :] == k, (q * a)[:, None], 0.0)
 
-        dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E = _membrane_adjoint(
-            dv, r, v, G, E, clip, mga, mglc, E_L_n, C_m_n, beta_n, rate_n, g_L_n,
-            inv_C_n, dt,
-            acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E,
-            WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN, MG_BLOCK,
+        # The adaptation after step t rose by its spike: la is its adjoint.
+        if ADAPT:
+            g_a = tl.load(a_saved + out, mask=live, other=0.0)
+            if WANT_ADAPT:
+                acc_adapt += la * s
+            if WANT_ADAPT_DECAY:
+                acc_adapt_decay += la * g_a
+        else:
+            g_a = 0.0
+        dv, dG, acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E, acc_E_a, d_ga = (
+            _membrane_adjoint(
+                dv, r, v, G, E, clip, mga, mglc, E_L_n, C_m_n, beta_n, rate_n, g_L_n,
+                inv_C_n, g_a, E_a, dt,
+                acc_reset, acc_E_L, acc_beta, acc_C_m, acc_E, acc_E_a,
+                WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN, MG_BLOCK,
+                ADAPT, WANT_E_ADAPT,
+            )
         )  # fmt: skip
+        if ADAPT:
+            la = la * a_decay + d_ga
 
         # Spike (surrogate) and probability outputs of step t, both of v - theta.
         x = v - theta_n
@@ -484,6 +557,12 @@ def scan_backward(
         acc_decay_r += tl.load(g_row, mask=sm, other=0.0) * H_r
         acc_decay_d += tl.load(g_row + S * N, mask=sm, other=0.0) * H_d
         _store_pair(grad_decay, acc_decay_r, acc_decay_d, b, n, j, sm, S, N)
+    if WANT_ADAPT:
+        tl.store(grad_adapt + idx, acc_adapt, mask=live)
+    if WANT_ADAPT_DECAY:
+        tl.store(grad_adapt_decay + idx, acc_adapt_decay, mask=live)
+    if WANT_E_ADAPT:
+        tl.store(grad_E_adapt + idx, acc_E_a, mask=live)
 
 
 @triton.jit
@@ -491,12 +570,13 @@ def recurrent_step(
     A_ff, W, w_start, lists, amps, counts, scale, made, jump, decay, E_syn, g_clip,
     mg_a, mg_lc, theta, U_reset, E_L, C_m, beta,
     v_state, g_state, spikes, noise, n_ref, counter,
-    v_saved, G_saved, A_saved, held_saved, track_v, track_I, track_g,
+    adapt, adapt_decay, E_adapt, a_state,
+    v_saved, G_saved, A_saved, held_saved, a_saved, track_v, track_I, track_g, track_a,
     dt_ptr, surr_ptr, track_b, t, t_ff, T, T_ff, B, N, L,
     K_REC: tl.constexpr, K_FF: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, ROWS: tl.constexpr, SAVE: tl.constexpr, TRACK: tl.constexpr,
     SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr,
-    GATED: tl.constexpr,
+    GATED: tl.constexpr, ADAPT: tl.constexpr,
 ):  # fmt: skip
     """Advance a recurrent network one step, for one trial and a block of neurons.
 
@@ -504,7 +584,7 @@ def recurrent_step(
     ``compact_spikes`` (pathway ``k``'s from row ``w_start[k]`` of ``W``; a saturating
     type's pathway shares its cell type's), with ``GATED`` each times its factor in
     ``amps``; feedforward ones are read from ``A_ff`` at ``t_ff``. The refractory period
-    as in ``scan_forward``.
+    and adaptation as in ``scan_forward``.
     """
     dt = tl.load(dt_ptr)
     surr_scale = tl.load(surr_ptr)
@@ -542,19 +622,31 @@ def recurrent_step(
         tl.load(beta + n, mask=live, other=0.5),
         dt,
     )
+    if ADAPT:
+        g_a = tl.load(a_state + idx, mask=live, other=0.0)
+        E_a = tl.load(E_adapt + n, mask=live, other=0.0)
+    else:
+        g_a = 0.0
+        E_a = 0.0
     G, I, I_leak, v_next = _membrane(
         v, r,
         gr, gd,
         tl.load(U_reset + n, mask=live),
         tl.load(E_L + n, mask=live),
         g_L_n, inv_C_n, rate_n,
-        E, clip, mga, mglc, dt, MG_BLOCK,
+        E, clip, mga, mglc, g_a, E_a, dt, MG_BLOCK, ADAPT,
     )  # fmt: skip
     if SAVE:
         tl.store(v_saved + out, v, mask=live)
         tl.store(G_saved + out[:, None] * S + j[None, :], G, mask=sm)
         if REFRACTORY:
             tl.store(held_saved + out, held.to(tl.int8), mask=live)
+        if ADAPT:
+            tl.store(a_saved + out, g_a, mask=live)
+    if ADAPT:  # the neuron's own spike raises it
+        g_a = g_a * tl.load(adapt_decay + n, mask=live, other=0.0)
+        g_a += tl.load(adapt + n, mask=live, other=0.0) * s
+        tl.store(a_state + idx, g_a, mask=live)
 
     gr = gr * tl.load(decay + j)[None, :]
     gd = gd * tl.load(decay + SP + j)[None, :]
@@ -601,19 +693,23 @@ def recurrent_step(
             track_v, track_I, track_g, b, n, t, T, N, j, live,
             v_next, I, I_leak, gr, gd, track_b, S,
         )  # fmt: skip
+        if ADAPT:
+            _track_adaptation(track_a, b, n, t, T, N, live, g_a, track_b)
 
 
 @triton.jit
 def inject_backward(
-    lv, lg, H_state, spikes, v_saved, G_saved, held_saved, A, scale, made, jump, decay,
-    E_syn, g_clip, mg_a, mg_lc, E_L, C_m, beta, grad_A, grad_scale, grad_reset,
-    grad_E_L, grad_C_m,
-    grad_beta, grad_E_syn, grad_decay, grad_jump, dt_ptr, t, B, T, N,
+    lv, lg, H_state, la_state, spikes, v_saved, G_saved, held_saved, a_saved, A, scale,
+    made, jump, decay, E_syn, g_clip, mg_a, mg_lc, E_L, C_m, beta, adapt_decay,
+    E_adapt, grad_A, grad_scale, grad_reset, grad_E_L, grad_C_m,
+    grad_beta, grad_E_syn, grad_decay, grad_jump, grad_adapt, grad_adapt_decay,
+    grad_E_adapt, dt_ptr, t, B, T, N,
     K: tl.constexpr, S: tl.constexpr, SP: tl.constexpr, BLOCK: tl.constexpr,
     WANT_SCALE: tl.constexpr, WANT_RESET: tl.constexpr, WANT_E_L: tl.constexpr,
     WANT_C_M: tl.constexpr, WANT_BETA: tl.constexpr, WANT_E_SYN: tl.constexpr,
-    WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr, REFRACTORY: tl.constexpr,
-    MG_BLOCK: tl.constexpr,
+    WANT_DECAY: tl.constexpr, WANT_JUMP: tl.constexpr, WANT_ADAPT: tl.constexpr,
+    WANT_ADAPT_DECAY: tl.constexpr, WANT_E_ADAPT: tl.constexpr,
+    REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr, ADAPT: tl.constexpr,
 ):  # fmt: skip
     """Step the adjoint back through the integration and injection of step ``t``.
 
@@ -624,7 +720,8 @@ def inject_backward(
     neuron's dL/da (``spike_backward``). ``H_state`` ``(B, 2, S, N)`` carries the
     decays' ``H`` (see the module docstring); the engine adds the initial
     conductances' term. One step of ``scan_backward``, but for the spike term.
-    ``held_saved`` as there.
+    ``held_saved`` and ``a_saved`` as there; ``la_state`` ``(B, N)`` carries the
+    adaptation's adjoint.
     """
     dt = tl.load(dt_ptr)
     idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -646,11 +743,25 @@ def inject_backward(
     ld = tl.load(lg + rows + S * N, mask=sm, other=0.0)
     out = (b * T + t) * N + n
     v = tl.load(v_saved + out, mask=live, other=0.0)
-    s = tl.load(spikes + out, mask=live, other=0.0)
+    spike = tl.load(spikes + out, mask=live, other=0.0)
+    s = spike
     if REFRACTORY:  # held at reset: by a spike, or the refractory period
         s = tl.maximum(s, tl.load(held_saved + out, mask=live, other=0).to(tl.float32))
     G = tl.load(G_saved + out[:, None] * S + j[None, :], mask=sm, other=0.0)
     G = G.to(tl.float32)
+
+    # The adaptation, as in scan_backward.
+    if ADAPT:
+        la = tl.load(la_state + idx, mask=live, other=0.0)
+        g_a = tl.load(a_saved + out, mask=live, other=0.0)
+        E_a = tl.load(E_adapt + n, mask=live, other=0.0)
+        if WANT_ADAPT:
+            _accumulate(grad_adapt + idx, la * spike, live)
+        if WANT_ADAPT_DECAY:
+            _accumulate(grad_adapt_decay + idx, la * g_a, live)
+    else:
+        g_a = 0.0
+        E_a = 0.0
 
     # The jumps and decays, as in scan_backward.
     if WANT_DECAY or WANT_JUMP:
@@ -680,12 +791,18 @@ def inject_backward(
     beta_n = tl.load(beta + n, mask=live, other=0.5)
     C_m_n = tl.load(C_m + n, mask=live, other=1.0)
     rate_n, g_L_n, inv_C_n = _leak(C_m_n, beta_n, dt)
-    dv, dG, g_reset, g_E_L, g_beta, g_C_m, g_E = _membrane_adjoint(
+    dv, dG, g_reset, g_E_L, g_beta, g_C_m, g_E, g_E_a, d_ga = _membrane_adjoint(
         dv, s, v, G, E, clip, mga, mglc, tl.load(E_L + n, mask=live), C_m_n,
-        beta_n, rate_n, g_L_n, inv_C_n, dt,
-        zero, zero, zero, zero, tl.zeros((BLOCK, SP), dtype=tl.float32),
+        beta_n, rate_n, g_L_n, inv_C_n, g_a, E_a, dt,
+        zero, zero, zero, zero, tl.zeros((BLOCK, SP), dtype=tl.float32), zero,
         WANT_RESET, WANT_E_L, WANT_BETA, WANT_C_M, WANT_E_SYN, MG_BLOCK,
+        ADAPT, WANT_E_ADAPT,
     )  # fmt: skip
+    if ADAPT:
+        a_decay = tl.load(adapt_decay + n, mask=live, other=0.0)
+        tl.store(la_state + idx, la * a_decay + d_ga, mask=live)
+        if WANT_E_ADAPT:
+            _accumulate(grad_E_adapt + idx, g_E_a, live)
     if WANT_RESET:
         _accumulate(grad_reset + idx, g_reset, live)
     if WANT_E_L:
