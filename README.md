@@ -57,6 +57,3 @@ and physiology), and the
 [API reference](https://wiretorch.readthedocs.io/en/latest/api/index.html).
 Setting up a development environment and running the tests is described under
 [Development](https://wiretorch.readthedocs.io/en/latest/development.html).
-
-wiretorch used to be called `connectome_snns`. That name still imports, with a
-deprecation warning.

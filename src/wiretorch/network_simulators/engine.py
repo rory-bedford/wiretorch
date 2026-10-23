@@ -39,10 +39,8 @@ SPARSE_WEIGHTS = 0.25
 
 
 def _backend() -> str:
-    """``WIRETORCH_BACKEND`` (formerly ``CONNECTOME_SNNS_BACKEND``), default triton."""
-    return os.environ.get(
-        "WIRETORCH_BACKEND", os.environ.get("CONNECTOME_SNNS_BACKEND", "triton")
-    )
+    """``WIRETORCH_BACKEND``, default triton."""
+    return os.environ.get("WIRETORCH_BACKEND", "triton")
 
 
 def uses_kernels(x: torch.Tensor, retain) -> bool:

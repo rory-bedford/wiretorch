@@ -87,15 +87,8 @@ def experiment_readme(metadata: dict, output_dir: Path) -> str:
         Path(metadata.get("output_dir", output_dir)) / "experiment.toml"
     ).resolve()
     params_suffix = Path(metadata["parameters_file"]).suffix[1:]
-    # Runs from before the rename recorded the library as connectome_snns.
-    library_commit = (
-        metadata.get("wiretorch_commit")
-        or metadata.get("connectome_snns_commit")
-        or "n/a"
-    )
-    library_dirty = metadata.get(
-        "wiretorch_dirty", metadata.get("connectome_snns_dirty")
-    )
+    library_commit = metadata.get("wiretorch_commit") or "n/a"
+    library_dirty = metadata.get("wiretorch_dirty")
 
     readme = f"""# Experiment Run - {status_emoji} {status.upper()}
 

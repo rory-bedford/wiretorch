@@ -4,6 +4,8 @@ The release notes of each version on GitHub are taken from its section here.
 
 ## [Unreleased]
 
+- Removed the former name `connectome_snns` (the import alias, `CONNECTOME_SNNS_BACKEND`,
+  and reading `connectome_snns_commit` from old experiment metadata): use `wiretorch`.
 - `recurrent_gradients` on `ConductanceLIFNetwork` and `CurrentLIFNetwork`: whether
   gradients flow through the recurrent spikes into the presynaptic neurons. Both
   families now support both settings, with Triton kernels for each. The defaults are

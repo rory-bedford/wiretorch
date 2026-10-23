@@ -7,5 +7,4 @@ checkpoints
 float16
 experiments
 zarr-output
-former-name
 ```
