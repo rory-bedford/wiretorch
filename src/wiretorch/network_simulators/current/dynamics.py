@@ -10,10 +10,14 @@ One step, for every neuron of every trial:
 2. **Decay** each synaptic current, then **inject** this step's input: every pathway
    adds its activation (presynaptic spikes times weights) times its kernel (its
    scaling factor, into each synapse type it makes). A synapse type with
-   ``tau_syn = 0`` keeps no memory: its current is just this step's input.
-3. **Integrate** ``v <- beta v + (1 - beta) (U_rest + R sum_j sign_j I_j)`` (the sign
-   is +1 for excitatory synapse types, -1 for inhibitory), and reset the neurons that
-   spiked. In natural units (the default) ``U_rest = 0`` and ``R = 1``. A neuron stays
+   ``tau_syn = 0`` keeps no memory: its current is just this step's input. A pathway
+   with short-term plasticity scales each spike by its release factor, from its
+   source's state (``network.gate_step``, part of the state ``gating``).
+3. **Integrate** ``v <- beta v + (1 - beta) (U_rest + R (sum_j sign_j I_j - I_a))``
+   (the sign is +1 for excitatory synapse types, -1 for inhibitory; ``I_a`` the
+   adaptation current of a neuron that adapts, part of the state ``adaptation``, which
+   decays with ``tau_adapt`` and rises by ``adapt`` at each of its spikes, just
+   before), and reset the neurons that spiked. In natural units (the default) ``U_rest = 0`` and ``R = 1``. A neuron stays
    at reset for the ``n_ref`` steps after its spike (its refractory period), and a
    counter per neuron (``refractory``, part of the state) tracks them.
 

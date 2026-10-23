@@ -98,7 +98,7 @@ class ConductanceLIFNetwork(ConductanceNetwork):
                 is treated as given. Default False, whose backward pass is one reverse
                 scan; True steps back one step at a time.
             rec_stp, ff_stp: Short-term plasticity per ``(source, target)`` cell type
-                pair of each side: ``STP``s (e.g. ``stp.DEPRESSING``) or dicts of
+                pair of each side: ``STP`` objects (e.g. ``stp.DEPRESSING``) or dicts of
                 ``U``, ``tau_D``, ``tau_F``; pairs not named have none (see ``stp``).
         """
         self.synapse_params = synapse_params

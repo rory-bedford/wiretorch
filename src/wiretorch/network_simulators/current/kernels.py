@@ -29,6 +29,10 @@ Layouts (all contiguous float32 unless noted):
 ``I`` and the recurrent weights ``W`` may instead be float16 (the network's
 ``storage_dtype``): loads convert them to float32, stores round back.
 
+A pathway with short-term plasticity scales each gathered weight row by its factor
+(``GATED``: see ``network_simulators.kernels``), and with ``ADAPT`` a neuron's
+adaptation current, stepped with the currents, is subtracted from its input.
+
 The backward pass needs no saved currents: the dynamics are linear in them, so their
 adjoint is carried back exactly from the voltage's. Nor does learnt physiology need
 more saved (each of its terms is compiled in only when it is learnt):

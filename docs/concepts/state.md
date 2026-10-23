@@ -3,8 +3,8 @@
 ## The state persists between calls
 
 A network keeps its state (voltages `v`, the synaptic variables `g` or `I_syn`, and in
-spiking networks the refractory counters and any saturating synapses' gating) between
-calls, so a long simulation can be run in chunks:
+spiking networks the refractory counters, the adaptation, and the presynaptic state of
+short-term plasticity and saturating synapses) between calls, so a long simulation can be run in chunks:
 
 ```python
 for chunk in chunks:          # each (batch, steps, inputs)

@@ -97,7 +97,7 @@ class CurrentLIFNetwork(CurrentNetwork):
                 is treated as given. Default True; False makes the backward pass one
                 reverse scan instead of a loop over steps.
             rec_stp, ff_stp: Short-term plasticity per ``(source, target)`` cell type
-                pair of each side: ``STP``s (e.g. ``stp.DEPRESSING``) or dicts of
+                pair of each side: ``STP`` objects (e.g. ``stp.DEPRESSING``) or dicts of
                 ``U``, ``tau_D``, ``tau_F``; pairs not named have none (see ``stp``).
         """
         self.synapse_params = synapse_params

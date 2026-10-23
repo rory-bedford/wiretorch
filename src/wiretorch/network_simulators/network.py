@@ -63,7 +63,7 @@ class InputSide:
         recurrent: Whether the sources are the network's own neurons.
         attribute: Name of the ``nn.ModuleDict`` holding the projections.
         mask_buffer: Name of the buffer holding the side's connectivity mask.
-        stp: Short-term plasticity per ``(source_name, target_name)`` pair (``STP``s,
+        stp: Short-term plasticity per ``(source_name, target_name)`` pair (``STP`` objects,
             or dicts of their fields); pairs not named have none.
     """
 

@@ -39,11 +39,14 @@ A synapse type with a voltage-dependent Mg block (NMDA) scales its current by
 ``MG_BLOCK`` (some synapse type has one) ``_membrane`` applies it and
 ``_membrane_adjoint`` its derivative, from the saved voltage, so nothing more is saved.
 
-A saturating synapse type is a pathway of its own, sharing its cell type's weight
-rows, whose spikes are scaled by the fraction of receptors they open
-(``network.gate_step``): with ``GATED``, ``recurrent_step`` multiplies each gathered
-row by its factor from ``compact_spikes``; feedforward factors enter the activations
-before the scan. Past the activations, nothing else changes.
+A pathway with presynaptic dynamics — short-term plasticity, a saturating synapse type
+— shares its cell type's weight rows, and its spikes are scaled by a factor from their
+source's state (``network.gate_step``): with ``GATED``, ``recurrent_step`` multiplies
+each gathered row by its factor from ``compact_spikes``; feedforward factors enter the
+activations before the scan. Past the activations, nothing else changes.
+
+With ``ADAPT`` a neuron's adaptation conductance (by ``E_adapt``) is one more term of
+the voltage step; it is saved per step, and the backward kernels carry its adjoint.
 
 Learnt physiology gets its gradient from the backward kernels too, each term compiled in
 only when it is learnt: per neuron ``theta``, ``U_reset``, ``E_L``, ``C_m`` and ``beta``,

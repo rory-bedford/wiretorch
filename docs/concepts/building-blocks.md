@@ -19,8 +19,10 @@ Conductance-based neurons have reversal potentials and separate rise and decay
 kinetics for each synapse type, so their input depends on the membrane voltage.
 Current-based neurons are simpler and use natural units by default (threshold 1, reset
 0). Rate neurons have a continuous output with a nonlinearity chosen per cell type. With
-their time constants set to zero they reduce to the standard rate equations
-({doc}`neuron-models`).
+their time constants set to zero they reduce to the standard rate equations. The
+spiking models can add a refractory period, spike-frequency adaptation and short-term
+depression and facilitation; the conductance-based ones also an NMDA Mg²⁺ block and
+receptor saturation ({doc}`neuron-models`).
 
 A recurrent network takes `rec_projections` between its own neurons and
 `ff_projections` from its inputs. A feedforward network only has `projections` from its

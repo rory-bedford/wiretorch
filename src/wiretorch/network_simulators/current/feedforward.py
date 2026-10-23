@@ -63,7 +63,7 @@ class FeedforwardCurrentLIFNetwork(CurrentNetwork):
                 true gradient (rate losses can filter it instead of sampled spikes).
             learn: Physiology to train (see ``CurrentNetwork``).
             stp: Short-term plasticity per ``(input, output)`` cell type pair:
-                ``STP``s (e.g. ``stp.DEPRESSING``) or dicts of ``U``, ``tau_D``,
+                ``STP`` objects (e.g. ``stp.DEPRESSING``) or dicts of ``U``, ``tau_D``,
                 ``tau_F``; pairs not named have none (see ``wiretorch.stp``).
         """
         self.cell_params_FF = cell_params_FF

@@ -21,12 +21,14 @@ model = wt.ConductanceLIFNetwork(
 
 | Neuron model | Per cell type | Per synapse type |
 |---|---|---|
-| Conductance-based | `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L` | `tau_rise`, `tau_decay`, `E_syn`, `g_bar` |
-| Current-based | `tau_mem`, `theta`, `U_reset`, `U_rest`, `R` | `tau_syn` |
+| Conductance-based | `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L`, `adapt`, `tau_adapt`, `E_adapt` | `tau_rise`, `tau_decay`, `E_syn`, `g_bar` |
+| Current-based | `tau_mem`, `theta`, `U_reset`, `U_rest`, `R`, `adapt`, `tau_adapt` | `tau_syn` |
 | Rate | `tau_mem`, `theta`, `gain` | `tau_syn` |
 
-The `tau_decay` of a saturating synapse type cannot be learnt, since the
-presynaptic gating shares it ({doc}`neuron-models`).
+`adapt` can be learnt only for cell types that adapt (`adapt > 0`). The `tau_decay` of
+a saturating synapse type cannot be learnt, since the presynaptic gating shares it,
+and the parameters of the Mg block and of short-term plasticity are fixed
+({doc}`neuron-models`).
 
 The learnt values start at the configured ones and are stored in
 `model.cell_parameters` and `model.synapse_parameters`. Time constants, conductances,

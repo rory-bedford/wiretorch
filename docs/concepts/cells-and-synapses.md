@@ -19,11 +19,14 @@ entries depend on the neuron model:
 
 | Neuron model | Required | Optional (default) |
 |---|---|---|
-| Conductance-based | `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L` | `tau_ref` (0) |
-| Current-based | `tau_mem` | `theta` (1), `U_reset` (0), `U_rest` (0), `R` (1), `tau_ref` (0) |
+| Conductance-based | `tau_mem`, `theta`, `U_reset`, `E_L`, `g_L` | `tau_ref` (0), `adapt` (0), `tau_adapt` (100), `E_adapt` (−90) |
+| Current-based | `tau_mem` | `theta` (1), `U_reset` (0), `U_rest` (0), `R` (1), `tau_ref` (0), `adapt` (0), `tau_adapt` (100) |
 | Rate | `tau_mem`, `nonlinearity` | `theta` (0), `gain` (1) |
 
-`tau_ref` is the refractory period in ms (see {doc}`neuron-models`).
+`tau_ref` is the refractory period in ms, and `adapt`, `tau_adapt` (ms) and `E_adapt`
+(mV) set spike-frequency adaptation (see {doc}`neuron-models`). Short-term plasticity
+is not a cell or synapse parameter: it belongs to a (source, target) pair, and the
+networks take it alongside the projections (`rec_stp`, `ff_stp`).
 
 ## Synapse types
 
