@@ -18,6 +18,12 @@ The release notes of each version on GitHub are taken from its section here.
 - Voltage-dependent NMDA in conductance-based networks: a synapse type's optional `mg`
   ([Mg²⁺], mM), `mg_slope` and `mg_k` give its current the Jahr–Stevens Mg²⁺ block.
   Fused into the existing kernels and compiled in only when a synapse type has a block.
+- Receptor saturation in conductance-based networks: a synapse type's optional
+  `saturation` gives each source neuron a gating variable (the fraction of its receptors
+  open, decaying with `tau_decay`), and each spike opens that fraction of the closed
+  ones, as in Brunel & Wang's (2001) NMDA. Its `g_bar` is then the conductance with every
+  receptor open. The gating is part of the state and the checkpoints; Triton kernels for
+  every path.
 
 ## [0.1.0b1] - 2026-10-22
 

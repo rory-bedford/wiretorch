@@ -27,7 +27,8 @@ class ConductanceLIFNetwork(ConductanceNetwork):
     spikes only if ``recurrent_gradients`` is True (``CurrentLIFNetwork``'s default).
 
     A cell type with a refractory period ``tau_ref`` (ms, rounded to whole steps) holds
-    its neurons at ``U_reset`` for that long after each spike, unable to spike.
+    its neurons at ``U_reset`` for that long after each spike, unable to spike. A
+    synapse type with ``saturation`` saturates: see ``network.gate_step``.
 
     The state (``v``, ``g``) continues across ``forward`` calls, so a long simulation
     can be run in chunks; call ``reset_state()`` before an independent one.
@@ -74,7 +75,8 @@ class ConductanceLIFNetwork(ConductanceNetwork):
             cell_params_FF: Input cell types ('name', 'cell_id').
             synapse_params, synapse_params_FF: Synapses made by each side's cell types:
                 'synapse_id', 'cell_id', 'name', 'tau_rise', 'tau_decay', 'E_syn',
-                'g_bar', optional 'g_clip'.
+                'g_bar', optional 'g_clip' (clipping), 'mg', 'mg_slope', 'mg_k' (the
+                Mg block) and 'saturation' (see the class docstring).
             surrgrad_scale: Scale of the surrogate gradient (and of the escape noise).
             batch_size: Number of trials simulated in parallel.
             spike_mode: ``"deterministic"`` (Heaviside) or ``"sample"`` (Bernoulli).

@@ -16,6 +16,7 @@ from wiretorch.network_simulators.conductance.synapses import (
     conductance_kernel,
     mg_block_tables,
     neuron_tables,
+    saturation_table,
     synapse_tables,
 )
 from wiretorch.network_simulators.network import (  # noqa: F401 - re-exported
@@ -55,7 +56,8 @@ class ConductanceNetwork(ProjectionNetwork):
     The learnt values are ``cell_parameters`` and ``synapse_parameters``
     (``TypeParameters``; time constants, ``g_L`` and ``g_bar`` as logarithms), and
     replace the buffers' values for those types. Only what is learnt costs anything in
-    the backward pass.
+    the backward pass. The ``tau_decay`` of a saturating synapse type, which its
+    presynaptic gating shares, cannot be learnt.
     """
 
     #: Name of the conductance state (also its checkpoint key).
@@ -134,12 +136,32 @@ class ConductanceNetwork(ProjectionNetwork):
         for name, table in mg_block_tables(self.registry).items():
             self.register_buffer(name, table, persistent=False)
         self._mg_block = bool(self.mg_c.any())
+        self.register_buffer(
+            "saturation", saturation_table(self.registry), persistent=False
+        )
         self._register_refractory()
         self.register_buffer(
             "surrgrad_scale", torch.tensor(self._surrgrad_scale, dtype=torch.float32)
         )
         self._register_synapse_maps(self._unify_synapses)
         self._register_learnt(self.learn, LEARNABLE, LEARNABLE_SYNAPSE, POSITIVE)
+        learnt = getattr(self, "_learnt_tau_decay", None)
+        if learnt is not None and (learnt & (self.saturation > 0)).any():
+            names = [
+                s["name"]
+                for s, saturates in zip(
+                    self.registry.synapses, learnt & (self.saturation > 0)
+                )
+                if saturates
+            ]
+            raise ValueError(
+                f"learn['tau_decay']: cannot learn the decay of the saturating synapse "
+                f"types {names}, which their presynaptic gating shares; name the types "
+                "to learn instead"
+            )
+
+    def _saturation(self) -> torch.Tensor:
+        return self.saturation
 
     def _register_synapse_maps(self, unified: bool) -> None:
         """Which synapse types each cell type makes, as the original simulators stored
@@ -170,9 +192,14 @@ class ConductanceNetwork(ProjectionNetwork):
         self.register_buffer("alpha", torch.exp(-self.dt / self.tau_syn))
         self.register_buffer("beta", torch.exp(-self.dt / self.tau_mem))
         self.register_buffer(
-            "g_scale", conductance_kernel(self.tau_rise, self.tau_decay, self.g_bar)
+            "g_scale", self._kernel(self.tau_rise, self.tau_decay, self.g_bar)
         )
+        # The saturating types' gating variables decay as their conductances do.
+        self.register_buffer("_gate_decay", self.alpha[1].clone(), persistent=False)
         self._set_refractory()
+
+    def _kernel(self, tau_rise, tau_decay, g_bar) -> torch.Tensor:
+        return conductance_kernel(tau_rise, tau_decay, g_bar, self.saturation > 0)
 
     def _physiology(self) -> Physiology:
         learnt = self._learnt
@@ -183,7 +210,7 @@ class ConductanceNetwork(ProjectionNetwork):
             tau_rise = learnt("tau_rise", self.tau_rise)
             tau_decay = learnt("tau_decay", self.tau_decay)
             decay = torch.exp(-self.dt / torch.stack((tau_rise, tau_decay)))
-            jump = conductance_kernel(tau_rise, tau_decay, learnt("g_bar", self.g_bar))
+            jump = self._kernel(tau_rise, tau_decay, learnt("g_bar", self.g_bar))
         return Physiology(
             theta=learnt("theta", self.theta),
             U_reset=learnt("U_reset", self.U_reset),

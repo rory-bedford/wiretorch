@@ -16,6 +16,12 @@ projections, which decides what is computed when:
   call, so gradients reach their parameters (``FullRankProjection``,
   ``LowRankProjection`` and subclasses).
 
+A synapse type can **saturate** (conductance-based networks): each source neuron then
+keeps a gating variable per such type, the fraction of its receptors that are open,
+and a spike opens only a fraction of those still closed (see ``gate_step``). Such a
+type gets a pathway of its own, sharing the rows and weights of its source cell type's
+pathway, whose activation is each spike times the fraction it opens.
+
 What a family adds is its physiology: the per-neuron and per-synapse tables, the
 synaptic state, and an ``engine`` whose ``simulate`` runs the time steps (each
 family's ``dynamics.py`` in PyTorch, its ``kernels.py`` in Triton).
@@ -67,12 +73,18 @@ class InputSide:
 
 @dataclass(frozen=True)
 class Pathway:
-    """One source cell type on one input side (see the module docstring)."""
+    """One source cell type on one input side (see the module docstring).
+
+    A saturating synapse type's pathway has its index as ``gate``, and shares the rows
+    and weights of the pathway ``source`` (its cell type's first; itself otherwise).
+    """
 
     index: int
     side: int
     cell_type: int
     mode: str  # "fixed" | "scaling_factors" | "weights"
+    source: int
+    gate: int | None = None
 
 
 @dataclass
@@ -85,6 +97,11 @@ class Drive:
 
     ``made`` ``(K, S)`` marks the synapse types each pathway makes; ``scale`` ``(K, N)``
     multiplies its kernel per target neuron (a scaling factor, or 1).
+
+    A saturating synapse type's pathway (see the module docstring) shares its rows and
+    weights — the same tensors — with its cell type's other pathway, and has a
+    ``gates`` entry: its ``saturation`` and the per-step ``decay`` of its gating
+    variables, and the columns of the gating state ``(B, R)`` that hold them.
     """
 
     made: torch.Tensor
@@ -96,13 +113,90 @@ class Drive:
     #: Whether gradients flow through the recurrent spikes, into the presynaptic
     #: neurons' surrogates; if not, the recurrent activations are treated as input.
     recurrent_gradients: bool = False
+    #: Per pathway (recurrent first), its ``Gate`` if it saturates, else None.
+    gates: list[Gate | None] = field(default_factory=list)
 
-    def feedforward_activations(self, x: torch.Tensor) -> torch.Tensor:
-        """``(K_ff, B, T, N)``: each feedforward pathway's input times its weights."""
+    def gate(self, k: int) -> Gate | None:
+        return self.gates[k] if self.gates else None
+
+    @property
+    def gated(self) -> bool:
+        """Whether any pathway saturates."""
+        return any(g is not None for g in self.gates)
+
+    def feedforward_activations(
+        self, x: torch.Tensor, factors: list | None = None
+    ) -> torch.Tensor:
+        """``(K_ff, B, T, N)``: each feedforward pathway's input times its weights;
+        a saturating pathway's input first times its ``factors`` (see
+        ``gate_feedforward``)."""
         B, T = x.shape[:2]
         if not self.feedforward:
             return x.new_zeros((0, B, T, 0))
-        return torch.stack([x[:, :, rows] @ W for rows, W in self.feedforward])
+        factors = factors or [None] * len(self.feedforward)
+        return torch.stack(
+            [
+                (x[:, :, rows] if f is None else x[:, :, rows] * f) @ W
+                for (rows, W), f in zip(self.feedforward, factors)
+            ]
+        )
+
+
+@dataclass(frozen=True)
+class Gate:
+    """A saturating pathway's gating: ``saturation`` and per-step ``decay`` (0-d
+    tensors), and its columns ``start:stop`` of the gating state."""
+
+    saturation: torch.Tensor
+    decay: torch.Tensor
+    start: int
+    stop: int
+
+    @property
+    def columns(self) -> slice:
+        return slice(self.start, self.stop)
+
+
+def gate_step(u, s, gate: Gate):
+    """One step of a pathway's gating variables ``u`` ``(B, n_rows)`` given its source
+    neurons' spikes ``s``: they decay, then each spike opens the fraction
+    ``saturation`` of the receptors still closed,
+
+        f = saturation (1 - decay u),    u <- min(decay u + s f, 1).
+
+    Returns ``(f, u)``: ``s f`` is the pathway's input, in place of ``s``. Neither
+    carries a gradient (the gating is not differentiated; a spike's gradient is scaled
+    by its ``f``).
+    """
+    u = u * gate.decay
+    f = gate.saturation * (1 - u)
+    return f, torch.clamp(u + s.detach() * f, max=1.0)
+
+
+def gate_feedforward(drive: Drive, x: torch.Tensor, gating: torch.Tensor | None):
+    """The factors ``f`` ``(B, T, n_rows)`` of the saturating feedforward pathways
+    (None for the others) over the chunk ``x``, and the gating state after it.
+
+    A step at a time: the reference, and the CPU path.
+    """
+    K_rec = len(drive.recurrent)
+    gates = [drive.gate(K_rec + k) for k in range(len(drive.feedforward))]
+    if not any(gates):
+        return None, gating
+    gating = gating.clone()
+    factors = []
+    x = x.detach()
+    for (rows, _), gate in zip(drive.feedforward, gates):
+        if gate is None:
+            factors.append(None)
+            continue
+        u, fs = gating[:, gate.columns], []
+        for t in range(x.shape[1]):
+            f, u = gate_step(u, x[:, t, rows], gate)
+            fs.append(f)
+        gating[:, gate.columns] = u
+        factors.append(torch.stack(fs, dim=1))
+    return factors, gating
 
 
 def stack_steps(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -147,7 +241,8 @@ class Run:
 
     ``output`` is the network's output per step, ``(B, T, N)``: spikes, or rates for a
     rate network. ``v`` and ``syn`` are the state after the last step, and for a
-    spiking network ``refractory`` the steps of refractory period each neuron has left.
+    spiking network ``refractory`` the steps of refractory period each neuron has left,
+    and ``gating`` the saturating pathways' gating state (None if there are none).
     ``tracked`` (if tracking) holds per-step variables of the tracked trial(s), named by
     the family's dynamics.
     """
@@ -158,6 +253,7 @@ class Run:
     probabilities: torch.Tensor | None = None
     tracked: dict[str, torch.Tensor] | None = None
     refractory: torch.Tensor | None = None
+    gating: torch.Tensor | None = None
 
     @property
     def spikes(self) -> torch.Tensor:
@@ -177,9 +273,10 @@ class ProjectionNetwork(nn.Module):
     (``_register_physiology``), derive what depends on the time step
     (``_set_timestep``), and supply the engine and its parameters (``_engine``,
     ``_physiology``). The state — ``v`` ``(B, N)``, the synaptic state named
-    ``state_name`` ``(B, N, ..., S)`` and, in a spiking network, the refractory
-    counters ``refractory`` ``(B, N)`` — continues from one ``forward`` call to the
-    next until ``reset_state``.
+    ``state_name`` ``(B, N, ..., S)``, in a spiking network the refractory counters
+    ``refractory`` ``(B, N)``, and the saturating pathways' gating variables
+    ``gating`` ``(B, R)`` — continues from one ``forward`` call to the next until
+    ``reset_state``.
     """
 
     #: Name of the synaptic state (also its checkpoint key).
@@ -264,6 +361,17 @@ class ProjectionNetwork(nn.Module):
     def _initial_state(self) -> tuple[torch.Tensor, torch.Tensor]:
         """``(v, syn)`` of a network at rest, for ``self.batch_size`` trials."""
         raise NotImplementedError
+
+    def _saturation(self) -> torch.Tensor:
+        """``(S,)``: each synapse type's saturation (0: none; see ``gate_step``).
+        Only the conductance-based family has any."""
+        saturating = [s["name"] for s in self.registry.synapses if s.get("saturation")]
+        if saturating:
+            raise ValueError(
+                f"synapse params: {saturating} set 'saturation', which only "
+                "conductance-based networks have"
+            )
+        return torch.zeros(len(self.registry))
 
     # ------------------------------------------------------------------
     # Construction
@@ -419,7 +527,9 @@ class ProjectionNetwork(nn.Module):
         return any(hasattr(self, f"_learnt_{name}") for name in names)
 
     def _pathways(self) -> list[Pathway]:
-        """One pathway per source cell type with synapses and projections, per side."""
+        """One pathway per source cell type with synapses and projections, per side,
+        and one more per saturating synapse type it makes (sharing its rows)."""
+        saturating = self._saturation() > 0
         pathways, made = [], []
         for side_index, side in enumerate(self._sides):
             names = {c["cell_id"]: c["name"] for c in side.cell_params}
@@ -438,13 +548,22 @@ class ProjectionNetwork(nn.Module):
                 mode = modes.get(names[cell_type])
                 if mode is None:
                     continue  # no projections: contributes nothing
-                pathway = Pathway(len(pathways), side_index, cell_type, mode)
+                source = len(pathways)
                 rows = np.flatnonzero(side.cell_type_indices == cell_type)
-                self.register_buffer(
-                    f"_rows_{pathway.index}", _long(rows), persistent=False
-                )
-                pathways.append(pathway)
-                made.append(synapses)
+                self.register_buffer(f"_rows_{source}", _long(rows), persistent=False)
+                plain = synapses & ~saturating
+                parts = [(None, plain)] if plain.any() else []
+                for gate in torch.nonzero(synapses & saturating).flatten().tolist():
+                    one = torch.zeros_like(synapses)
+                    one[gate] = True
+                    parts.append((gate, one))
+                for gate, mask in parts:
+                    pathways.append(
+                        Pathway(
+                            len(pathways), side_index, cell_type, mode, source, gate
+                        )
+                    )
+                    made.append(mask)
         self.register_buffer(
             "_made",
             torch.stack(made)
@@ -453,7 +572,17 @@ class ProjectionNetwork(nn.Module):
             persistent=False,
         )
         # Recurrent pathways first: the order the dynamics inject them in.
-        return sorted(pathways, key=lambda p: not self._sides[p.side].recurrent)
+        pathways = sorted(pathways, key=lambda p: not self._sides[p.side].recurrent)
+        # The gating state's columns: each saturating pathway's source rows, in order.
+        columns, start = {}, 0
+        for p in pathways:
+            if p.gate is not None:
+                n_rows = getattr(self, f"_rows_{p.source}").numel()
+                columns[p.index] = (start, start + n_rows)
+                start += n_rows
+        self._gate_columns = columns
+        self.n_gating = start
+        return pathways
 
     def _assemble(self, pathway: Pathway, connectome: bool = False) -> torch.Tensor:
         """The ``(n_rows, N)`` weights of a pathway, from its projections' ``forward``.
@@ -462,7 +591,7 @@ class ProjectionNetwork(nn.Module):
         connectome instead (the scaling factor is applied to the kernel).
         """
         side = self._sides[pathway.side]
-        rows = getattr(self, f"_rows_{pathway.index}")
+        rows = getattr(self, f"_rows_{pathway.source}")
         W = torch.zeros((rows.numel(), self.n_neurons), **self._float)
         projections = getattr(self, side.attribute)
         src = next(
@@ -479,9 +608,10 @@ class ProjectionNetwork(nn.Module):
         return W
 
     def _cache_weights(self) -> None:
-        """Snapshot the weights of fixed and scaling-factor pathways."""
+        """Snapshot the weights of fixed and scaling-factor pathways (once per source:
+        a saturating type's pathway shares its cell type's)."""
         for pathway in self.pathways:
-            if pathway.mode != "weights":
+            if pathway.mode != "weights" and pathway.source == pathway.index:
                 W = self._assemble(
                     pathway, connectome=pathway.mode == "scaling_factors"
                 )
@@ -540,14 +670,16 @@ class ProjectionNetwork(nn.Module):
 
     def _drive(self) -> Drive:
         """The pathways' current weights and kernel scales, for one forward call."""
-        scaling = {}
+        scaling, assembled = {}, {}
         ones = torch.ones(self.n_neurons, **self._float)
-        scales, recurrent, feedforward = [], [], []
+        scales, recurrent, feedforward, gates = [], [], [], []
         for pathway in self.pathways:
-            if pathway.mode == "weights":
-                W = self._assemble(pathway)
+            if pathway.mode != "weights":
+                W = getattr(self, f"_weights_{pathway.source}")
+            elif pathway.source in assembled:  # the very tensor: see ``Drive``
+                W = assembled[pathway.source]
             else:
-                W = getattr(self, f"_weights_{pathway.index}")
+                W = assembled[pathway.source] = self._assemble(pathway)
             if pathway.mode == "scaling_factors":
                 if pathway.side not in scaling:
                     scaling[pathway.side] = self._scaling_matrix(pathway.side)
@@ -556,10 +688,11 @@ class ProjectionNetwork(nn.Module):
                 )
             else:
                 scales.append(ones)
-            rows = getattr(self, f"_rows_{pathway.index}")
+            rows = getattr(self, f"_rows_{pathway.source}")
             (recurrent if self._sides[pathway.side].recurrent else feedforward).append(
                 (rows, W)
             )
+            gates.append(self._gate(pathway))
         order = [p.index for p in self.pathways]
         return Drive(
             made=self._made[order],
@@ -570,6 +703,19 @@ class ProjectionNetwork(nn.Module):
             feedforward=feedforward,
             differentiable_inputs=self.differentiable_inputs,
             recurrent_gradients=self.recurrent_gradients,
+            gates=gates if self.n_gating else [],
+        )
+
+    def _gate(self, pathway: Pathway) -> Gate | None:
+        """A saturating pathway's ``Gate``: its type's saturation and the per-step
+        decay of its gating variables, ``exp(-dt / tau_decay)`` (fixed: see
+        ``_gate_decay``)."""
+        if pathway.gate is None:
+            return None
+        return Gate(
+            self.saturation[pathway.gate],
+            self._gate_decay[pathway.gate],
+            *self._gate_columns[pathway.index],
         )
 
     # The time loop runs in the engine (Triton kernels on CUDA): there is nothing for
@@ -588,6 +734,7 @@ class ProjectionNetwork(nn.Module):
             self._drive(),
             self._physiology(),
             **({"refractory": self.refractory} if self.has_refractory else {}),
+            **({"gating": self.gating} if self.n_gating else {}),
             probabilities=probabilities,
             track=self.track_variables,
             track_batch_idx=self.track_batch_idx,
@@ -600,6 +747,8 @@ class ProjectionNetwork(nn.Module):
         self._synaptic = run.syn.detach()
         if run.refractory is not None:
             self.refractory = run.refractory
+        if run.gating is not None:
+            self.gating = run.gating
         return run
 
     def _validate_forward(self, input_spikes: torch.Tensor) -> None:
@@ -643,16 +792,20 @@ class ProjectionNetwork(nn.Module):
                 (self.batch_size, self.n_neurons), dtype=torch.int32, device=self.device
             )
             self.register_buffer("refractory", counter, persistent=False)
+        gating = torch.zeros((self.batch_size, self.n_gating), device=self.device)
+        self.register_buffer("gating", gating, persistent=False)
 
     def get_checkpoint_state(self) -> dict[str, np.ndarray]:
         """The state; the refractory counters only if a neuron has a refractory period
-        (they are zero otherwise)."""
+        (they are zero otherwise), the gating state only if a synapse type saturates."""
         state = {
             "v": self.v.cpu().numpy(),
             self.state_name: self._synaptic.cpu().numpy(),
         }
         if self._refractory:
             state["refractory"] = self.refractory.cpu().numpy()
+        if self.n_gating:
+            state["gating"] = self.gating.cpu().numpy()
         return state
 
     def load_checkpoint_state(self, state: dict[str, np.ndarray]) -> None:
@@ -664,6 +817,11 @@ class ProjectionNetwork(nn.Module):
                 if "refractory" in state
                 else torch.zeros_like(self.v, dtype=torch.int32)
             )
+        self.gating = (
+            torch.from_numpy(state["gating"]).to(self.device)
+            if "gating" in state
+            else torch.zeros((self.v.shape[0], self.n_gating), device=self.device)
+        )
 
     def get_tracked_gradients(self) -> dict[str, torch.Tensor]:
         """Gradients of the tracked per-step ``v``, synaptic state and output.

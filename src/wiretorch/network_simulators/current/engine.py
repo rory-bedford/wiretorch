@@ -245,8 +245,9 @@ def _recurrent(L, A_ff_blocks, W, rows, sizes, scale, v, I, spikes, saved):
             t = t0 + i
             kernels.compact_spikes[(L.B, L.K_rec)](
                 v, L.p.theta, L.noise, L.counter, rows, starts, lists, counts,
-                surr, t, L.B, L.T, L.N, capacity,
+                *(L.dummy,) * 6, surr, t, L.B, L.T, L.N, capacity, 0, 0,
                 BLOCK=COMPACT_BLOCK, SAMPLE=L.sample, REFRACTORY=L.refractory,
+                GATED=False, SAVE=False,
             )  # fmt: skip
             kernels.recurrent_step[(L.B, triton.cdiv(L.N, STEP_BLOCK))](
                 A_ff, W, starts[:-1], lists, counts, scale, L.made, L.sign, L.decay,

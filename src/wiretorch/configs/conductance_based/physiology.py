@@ -27,7 +27,8 @@ class SynapseConfig(Config):
 
     Supports multiple synapse types per cell type (e.g., AMPA and NMDA for excitatory cells).
     NMDA's voltage dependence is set by ``mg`` (e.g. 1.0 mM for each NMDA type, 0 for the
-    others), with optional ``mg_slope`` and ``mg_k``.
+    others), with optional ``mg_slope`` and ``mg_k``; its receptor saturation by
+    ``saturation``.
     """
 
     names: List[str]  # Synapse type names (e.g., ["AMPA", "NMDA"])
@@ -43,6 +44,9 @@ class SynapseConfig(Config):
     mg_list: Optional[List[float]] = Field(default=None, alias="mg")
     mg_slope_list: Optional[List[float]] = Field(default=None, alias="mg_slope")
     mg_k_list: Optional[List[float]] = Field(default=None, alias="mg_k")
+    # Receptor saturation: the fraction of a source's closed receptors one spike opens
+    # (0 or unset: none).
+    saturation_list: Optional[List[float]] = Field(default=None, alias="saturation")
 
     @property
     def tau_rise(self) -> np.ndarray:
@@ -66,7 +70,7 @@ class SynapseConfig(Config):
 
     @property
     def g_clip(self) -> Optional[np.ndarray]:
-        """Maximum summed conductance (nS) for saturation, or None if no clipping."""
+        """Maximum summed conductance (nS) for clipping, or None if no clipping."""
         if self.g_clip_list is None:
             return None
         return np.array(self.g_clip_list)

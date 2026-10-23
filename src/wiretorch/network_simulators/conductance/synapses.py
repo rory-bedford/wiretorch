@@ -56,14 +56,32 @@ def mg_block_tables(registry: SynapseRegistry) -> dict[str, torch.Tensor]:
     }
 
 
+def saturation_table(registry: SynapseRegistry) -> torch.Tensor:
+    """Each synapse type's ``saturation``: the fraction of a source neuron's closed
+    receptors (of that type) that one of its spikes opens. 0 (the default) is no
+    saturation: every spike adds the same conductance."""
+    saturation = registry.table("saturation", default=0.0)
+    assert ((saturation >= 0) & (saturation <= 1)).all(), (
+        "synapse params: saturation must be in [0, 1]"
+    )
+    return saturation
+
+
 def conductance_kernel(
-    tau_rise: torch.Tensor, tau_decay: torch.Tensor, g_bar: torch.Tensor
+    tau_rise: torch.Tensor,
+    tau_decay: torch.Tensor,
+    g_bar: torch.Tensor,
+    saturating: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``(2, n_synapse_types)`` jump of the rise and decay components per unit input.
 
     The rise component jumps by ``-g_bar`` and the decay component by ``+g_bar``,
-    normalised so the difference-of-exponentials waveform peaks at ``g_bar``.
+    normalised so the difference-of-exponentials waveform peaks at ``g_bar`` — except
+    for the ``saturating`` types, whose input is the fraction of receptors opened, so
+    that ``g_bar`` is their conductance with every receptor open.
     """
     r = tau_rise / tau_decay
     peak = r ** (r / (1 - r)) - r ** (1 / (1 - r))
+    if saturating is not None:
+        peak = torch.where(saturating, torch.ones_like(peak), peak)
     return torch.stack([-g_bar, g_bar], dim=0) / peak

@@ -9,6 +9,12 @@ A recurrent step starts with ``compact_spikes``, which lists, per trial and recu
 pathway, the source neurons that fire now; the family's ``recurrent_step`` then gathers
 only those weight rows (spikes are sparse, ~1% of neurons per ms).
 
+A saturating pathway (see ``network.gate_step``) scales each spike by the fraction of
+its source's closed receptors it opens, from the source's gating variable: with
+``GATED``, ``compact_spikes`` steps the recurrent pathways' gating variables and lists
+each fired row's factor beside it, and ``gate_scan`` steps the feedforward ones through
+a chunk of input.
+
 When gradients flow through the recurrent spikes, the backward pass steps back one step
 at a time: the family's ``inject_backward`` gives each pathway's ``dL/da``, the engine
 carries it to the presynaptic spikes (``R = dL/da W^T``), and ``spike_backward`` adds
@@ -56,16 +62,59 @@ def _spike_adjoint(x, grad, surr_scale, SAMPLE: tl.constexpr):
 
 
 @triton.jit
+def _gate(u, s, saturation, decay):
+    """``network.gate_step``: the factor ``f`` of a spike ``s``, and ``u`` after it."""
+    u = u * decay
+    f = saturation * (1 - u)
+    return f, tl.minimum(u + s * f, 1.0)
+
+
+@triton.jit
+def gate_scan(
+    x, rows, saturation, decay, gating, factors, B, T, n_in, R, RG, col0,
+    BLOCK: tl.constexpr,
+):  # fmt: skip
+    """Step the gating variables of the saturating feedforward pathways through a
+    chunk of input ``x`` ``(B, T, n_in)``.
+
+    The ``RG`` gating columns ``col0 ..`` of ``gating`` ``(B, R)`` (updated in place)
+    belong to input rows ``rows`` ``(RG,)`` int32, with their pathway's ``saturation``
+    and ``decay`` ``(RG,)``; ``factors`` ``(B, T, RG)`` gets each step's ``f``.
+    """
+    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)  # flat (trial, column)
+    live = idx < B * RG
+    b = idx // RG
+    i = idx % RG
+    row = tl.load(rows + i, mask=live, other=0)
+    c = tl.load(saturation + i, mask=live, other=0.0)
+    d = tl.load(decay + i, mask=live, other=0.0)
+    u = tl.load(gating + b * R + col0 + i, mask=live, other=0.0)
+    for t in range(T):
+        s = tl.load(x + (b * T + t) * n_in + row, mask=live, other=0.0)
+        f, u = _gate(u, s, c, d)
+        tl.store(factors + (b * T + t) * RG + i, f, mask=live)
+    tl.store(gating + b * R + col0 + i, u, mask=live)
+
+
+@triton.jit
 def compact_spikes(
     v, theta, noise, counter, rows, row_start, lists, counts,
-    surr_ptr, t, B, T, N, L,
+    gate_saturation, gate_decay, gate_col, gating, amps, f_saved,
+    surr_ptr, t, B, T, N, L, R, R_SAVED,
     BLOCK: tl.constexpr, SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr,
+    GATED: tl.constexpr, SAVE: tl.constexpr,
 ):  # fmt: skip
     """List, in order, the rows of recurrent pathway ``k`` whose neuron fires now.
 
     One program per (trial, pathway). ``rows`` holds every recurrent pathway's source
     neurons back to back, ``row_start`` (K + 1) where each pathway's begin. A neuron
     whose refractory ``counter`` ``(B, N)`` is not zero does not fire.
+
+    With ``GATED`` (some pathway saturates), ``amps`` ``(K, B, L)`` gets each listed
+    row's factor beside it: 1, or for a saturating pathway (``gate_col[k]``, its first
+    column of ``gating`` ``(B, R)``, is not -1) its ``f``, as its gating variables are
+    stepped (in place); with ``SAVE`` also every row's ``f`` into ``f_saved``
+    ``(B, T, R_SAVED)``, for the backward pass.
     """
     surr_scale = tl.load(surr_ptr)
     b = tl.program_id(0)
@@ -88,6 +137,20 @@ def compact_spikes(
             fired = fired & (tl.load(counter + b * N + neuron, mask=m, other=0) == 0)
         position = count + tl.cumsum(fired.to(tl.int32), axis=0) - 1
         tl.store(lists + (k * B + b) * L + position, r, mask=fired)
+        if GATED:
+            col = tl.load(gate_col + k)
+            if col >= 0:
+                gu = tl.load(gating + b * R + col + r, mask=m, other=0.0)
+                f, gu = _gate(
+                    gu, fired.to(tl.float32), tl.load(gate_saturation + k),
+                    tl.load(gate_decay + k),
+                )  # fmt: skip
+                tl.store(gating + b * R + col + r, gu, mask=m)
+                if SAVE:
+                    tl.store(f_saved + (b * T + t) * R_SAVED + col + r, f, mask=m)
+            else:
+                f = tl.full((BLOCK,), 1.0, tl.float32)
+            tl.store(amps + (k * B + b) * L + position, f, mask=fired)
         count += tl.sum(fired.to(tl.int32), axis=0)
     tl.store(counts + k * B + b, count)
 

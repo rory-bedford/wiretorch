@@ -25,6 +25,9 @@ model = wt.ConductanceLIFNetwork(
 | Current-based | `tau_mem`, `theta`, `U_reset`, `U_rest`, `R` | `tau_syn` |
 | Rate | `tau_mem`, `theta`, `gain` | `tau_syn` |
 
+The `tau_decay` of a saturating synapse type cannot be learnt, since the
+presynaptic gating shares it ({doc}`neuron-models`).
+
 The learnt values start at the configured ones and are stored in
 `model.cell_parameters` and `model.synapse_parameters`. Time constants, conductances,
 `R` and `gain` are learnt as logarithms so that they stay positive. Parameters that

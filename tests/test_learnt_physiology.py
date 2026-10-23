@@ -125,44 +125,58 @@ def _kernels_vs_reference(builder, monkeypatch, warm_up=30, steps=60):
     The learnt physiology is moved off its defaults (natural units would leave, say,
     ``U_rest`` at 0, where its terms vanish), and a warm-up chunk without gradients
     runs first, so the chunk starts from currents that are not zero.
+
+    A gradient that sums terms which nearly cancel is known to float32 only to a few
+    digits, the reference's as much as the kernels': one that misses ``1e-3`` of its
+    scale must then be as close as the reference to a float64 run of the reference.
     """
-    results = []
-    for backend in ("triton", "torch"):
-        monkeypatch.setenv("WIRETORCH_BACKEND", backend)
-        built = builder()
-        model = built.model.to("cuda")
-        rng = np.random.default_rng(1)
-        with torch.no_grad():
-            for name, p in model.named_parameters():
-                if name.startswith(("cell_", "synapse_")):
-                    p += torch.from_numpy(
-                        0.1 * rng.standard_normal(p.shape).astype(np.float32)
-                    ).to("cuda")
-            model(torch.from_numpy(built.input_spikes[:, :warm_up]).to("cuda"))
-        x = torch.from_numpy(built.input_spikes[:, warm_up : warm_up + steps])
-        out = harness.unpack_output(model(x.to("cuda")))
-        rng = np.random.default_rng(3)
-        loss = 0
-        for key in ("spikes", "probabilities"):
-            if out.get(key) is not None:
-                readout = rng.standard_normal(out[key].shape).astype(np.float32)
-                loss = loss + (out[key] * torch.from_numpy(readout).to("cuda")).sum()
-        loss.backward()
-        grads = {
-            k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None
-        }
-        results.append((out["spikes"].detach(), model.v.clone(), grads))
-    (s_k, v_k, g_k), (s_r, v_r, g_r) = results
+    s_k, v_k, g_k = _gradients(builder, monkeypatch, "triton", warm_up, steps)
+    s_r, v_r, g_r = _gradients(builder, monkeypatch, "torch", warm_up, steps)
     assert s_r.sum() > 0
     torch.testing.assert_close(s_k, s_r, rtol=0, atol=0)
     torch.testing.assert_close(v_k, v_r, rtol=1e-4, atol=1e-4)
     assert g_k.keys() == g_r.keys() and g_k
+    g_64 = None
     for key in g_r:
         scale = g_r[key].abs().max().item() or 1.0
-        torch.testing.assert_close(
-            g_k[key], g_r[key], rtol=0, atol=1e-3 * scale, msg=key
-        )
+        if torch.allclose(g_k[key], g_r[key], rtol=0, atol=1e-3 * scale):
+            continue
+        if g_64 is None:
+            g_64 = _gradients(builder, monkeypatch, "torch", warm_up, steps, True)[2]
+        exact = g_64[key]
+        error_k = (g_k[key].double() - exact).abs().max().item()
+        error_r = (g_r[key].double() - exact).abs().max().item()
+        assert error_k <= 2 * error_r + 1e-4 * scale, (key, error_k, error_r)
     return g_r
+
+
+def _gradients(builder, monkeypatch, backend, warm_up, steps, float64=False):
+    """Spikes, final voltage and parameter gradients of ``_kernels_vs_reference``'s
+    run on ``backend``, in float64 if asked."""
+    monkeypatch.setenv("WIRETORCH_BACKEND", backend)
+    built = builder()
+    model = (built.model.double() if float64 else built.model).to("cuda")
+    rng = np.random.default_rng(1)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.startswith(("cell_", "synapse_")):
+                p += torch.from_numpy(
+                    0.1 * rng.standard_normal(p.shape).astype(np.float32)
+                ).to(p)
+        model(torch.from_numpy(built.input_spikes[:, :warm_up]).to("cuda"))
+    x = torch.from_numpy(built.input_spikes[:, warm_up : warm_up + steps])
+    out = harness.unpack_output(model(x.to("cuda")))
+    rng = np.random.default_rng(3)
+    loss = 0
+    for key in ("spikes", "probabilities"):
+        if out.get(key) is not None:
+            readout = rng.standard_normal(out[key].shape).astype(np.float32)
+            loss = loss + (out[key] * torch.from_numpy(readout).to(out[key])).sum()
+    loss.backward()
+    grads = {
+        k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None
+    }
+    return out["spikes"].detach(), model.v.clone(), grads
 
 
 @pytest.mark.gpu

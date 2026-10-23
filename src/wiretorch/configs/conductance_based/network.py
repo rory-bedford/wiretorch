@@ -46,7 +46,7 @@ class _SynapticLayerConfig(Config):
 
         Keys: 'name', 'synapse_id', 'cell_id', 'tau_rise', 'tau_decay', 'E_syn',
         'g_bar', and 'g_clip' if the cell type sets clipping, likewise 'mg', 'mg_slope',
-        'mg_k' (the Mg block).
+        'mg_k' (the Mg block) and 'saturation'.
         """
         cell_ids = {name: i for i, name in enumerate(self.cell_types.names)}
         synapse_params = []
@@ -63,7 +63,7 @@ class _SynapticLayerConfig(Config):
                 }
                 if synapse.g_clip is not None:
                     params["g_clip"] = synapse.g_clip[i]
-                for key in ("mg", "mg_slope", "mg_k"):
+                for key in ("mg", "mg_slope", "mg_k", "saturation"):
                     values = getattr(synapse, f"{key}_list")
                     if values is not None:
                         params[key] = values[i]

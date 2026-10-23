@@ -39,6 +39,12 @@ A synapse type with a voltage-dependent Mg block (NMDA) scales its current by
 ``MG_BLOCK`` (some synapse type has one) ``_membrane`` applies it and
 ``_membrane_adjoint`` its derivative, from the saved voltage, so nothing more is saved.
 
+A saturating synapse type is a pathway of its own, sharing its cell type's weight
+rows, whose spikes are scaled by the fraction of receptors they open
+(``network.gate_step``): with ``GATED``, ``recurrent_step`` multiplies each gathered
+row by its factor from ``compact_spikes``; feedforward factors enter the activations
+before the scan. Past the activations, nothing else changes.
+
 Learnt physiology gets its gradient from the backward kernels too, each term compiled in
 only when it is learnt: per neuron ``theta``, ``U_reset``, ``E_L``, ``C_m`` and ``beta``,
 per synapse type ``E_syn`` and per component the ``jump`` and ``decay``, summed per
@@ -59,6 +65,7 @@ from wiretorch.network_simulators.kernels import (  # noqa: F401 - re-exported
     _spike,
     _spike_adjoint,
     compact_spikes,
+    gate_scan,
     spike_backward,
 )
 
@@ -439,7 +446,7 @@ def scan_backward(
 
 @triton.jit
 def recurrent_step(
-    A_ff, W, w_start, lists, counts, scale, made, jump, decay, E_syn, g_clip,
+    A_ff, W, w_start, lists, amps, counts, scale, made, jump, decay, E_syn, g_clip,
     mg_a, mg_lc, theta, U_reset, E_L, C_m, beta,
     v_state, g_state, spikes, noise, n_ref, counter,
     v_saved, G_saved, A_saved, held_saved, track_v, track_I, track_g,
@@ -447,12 +454,15 @@ def recurrent_step(
     K_REC: tl.constexpr, K_FF: tl.constexpr, S: tl.constexpr, SP: tl.constexpr,
     BLOCK: tl.constexpr, ROWS: tl.constexpr, SAVE: tl.constexpr, TRACK: tl.constexpr,
     SAMPLE: tl.constexpr, REFRACTORY: tl.constexpr, MG_BLOCK: tl.constexpr,
+    GATED: tl.constexpr,
 ):  # fmt: skip
     """Advance a recurrent network one step, for one trial and a block of neurons.
 
     Recurrent activations are gathered from the weight rows listed by
-    ``compact_spikes``; feedforward ones are read from ``A_ff`` at ``t_ff``. The
-    refractory period as in ``scan_forward``.
+    ``compact_spikes`` (pathway ``k``'s from row ``w_start[k]`` of ``W``; a saturating
+    type's pathway shares its cell type's), with ``GATED`` each times its factor in
+    ``amps``; feedforward ones are read from ``A_ff`` at ``t_ff``. The refractory period
+    as in ``scan_forward``.
     """
     dt = tl.load(dt_ptr)
     surr_scale = tl.load(surr_ptr)
@@ -517,8 +527,13 @@ def recurrent_step(
                     W + row[:, None] * N + n[None, :],
                     mask=(m_ < fired)[:, None] & live[None, :],
                     other=0.0,
-                )
-                a += tl.sum(w.to(tl.float32), axis=0)
+                ).to(tl.float32)
+                if GATED:
+                    amp = tl.load(
+                        amps + (k * B + b) * L + m_, mask=m_ < fired, other=0.0
+                    )
+                    w = w * amp[:, None]
+                a += tl.sum(w, axis=0)
             if SAVE:
                 tl.store(A_saved + k * (B * T * N) + out, a, mask=live)
         else:

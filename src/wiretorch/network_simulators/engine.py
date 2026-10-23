@@ -8,6 +8,11 @@ Feedforward input is known for a whole chunk, so its synaptic drive — every pa
 input times its weights — is computed up front by ``activations``: dense matmuls, or one
 cuSPARSE product per pathway when the input is sparse (spike trains).
 
+A saturating pathway's input (see ``network.gate_step``) is its rows times their
+factors: ``gate_feedforward`` steps the feedforward gating through a chunk on the GPU.
+Such a pathway shares its weight rows with its cell type's other pathway, so the
+recurrent weights are laid out once per source (``recurrent_weights``).
+
 A recurrent network's backward pass needs the gradient w.r.t. its recurrent weights
 (``weight_gradient``) and, when gradients flow through the recurrent spikes
 (``Drive.recurrent_gradients``), each step's ``dL/da`` carried back to the presynaptic
@@ -23,7 +28,7 @@ import warnings
 
 import torch
 
-from wiretorch.network_simulators.network import Drive
+from wiretorch.network_simulators.network import Drive, gate_feedforward as _gate_ref
 
 warnings.filterwarnings("ignore", "Sparse CSR tensor support is in beta")
 
@@ -72,38 +77,50 @@ class _SparseActivations(torch.autograd.Function):
 
     Differentiable in the input and the weights; both gradients are dense matmuls
     (they are needed only for learnt weights, or when the input is another layer's
-    spikes).
+    spikes). A saturating pathway's rows are first scaled by its ``factors``
+    ``(B * T, n_rows)`` (None for the others), which carry no gradient.
     """
 
     @staticmethod
-    def forward(ctx, x2d, rows, differentiable, *weights):
-        ctx.rows, ctx.differentiable = rows, differentiable
+    def forward(ctx, x2d, rows, factors, differentiable, *weights):
+        ctx.rows, ctx.factors, ctx.differentiable = rows, factors, differentiable
         ctx.save_for_backward(x2d, *weights)
         x2d = x2d.detach()
         A = x2d.new_empty((len(rows), x2d.shape[0], weights[0].shape[1]))
         for k, (r, W) in enumerate(zip(rows, weights)):
-            torch.mm(x2d[:, r].to_sparse_csr(), W, out=A[k])
+            torch.mm(_rows(x2d, r, factors[k]).to_sparse_csr(), W, out=A[k])
         return A
 
     @staticmethod
     def backward(ctx, grad_A):
         x2d, *weights = ctx.saved_tensors
+        factors = ctx.factors
         grad_x = None
         if ctx.needs_input_grad[0]:
             grad_x = torch.zeros_like(x2d)
             span = ctx.differentiable or slice(0, x2d.shape[1])
             for k, (r, W) in enumerate(zip(ctx.rows, weights)):
                 keep = (r >= span.start) & (r < span.stop)  # only columns that need it
-                grad_x[:, r[keep]] = grad_A[k] @ W[keep].T
+                g = grad_A[k] @ W[keep].T
+                if factors[k] is not None:
+                    g = g * factors[k][:, keep]
+                grad_x[:, r[keep]] += g
         grad_W = [
-            x2d[:, r].T @ grad_A[k] if ctx.needs_input_grad[3 + k] else None
+            _rows(x2d, r, factors[k]).T @ grad_A[k]
+            if ctx.needs_input_grad[4 + k]
+            else None
             for k, r in enumerate(ctx.rows)
         ]
-        return grad_x, None, None, *grad_W
+        return grad_x, None, None, None, *grad_W
 
 
-def activations(drive: Drive, x: torch.Tensor) -> torch.Tensor:
-    """``(K_ff, B, T, N)`` feedforward activations, by sparse products if input is sparse.
+def _rows(x2d, rows, factors):
+    return x2d[:, rows] if factors is None else x2d[:, rows] * factors
+
+
+def activations(drive: Drive, x: torch.Tensor, factors=None) -> torch.Tensor:
+    """``(K_ff, B, T, N)`` feedforward activations, by sparse products if input is sparse;
+    ``factors`` those of the saturating pathways (see ``gate_feedforward``).
 
     Density is judged from the first step, which is cheap and, for spike trains, typical.
     """
@@ -112,14 +129,68 @@ def activations(drive: Drive, x: torch.Tensor) -> torch.Tensor:
         not drive.feedforward
         or torch.count_nonzero(first) > SPARSE_INPUT * first.numel()
     ):
-        return drive.feedforward_activations(x)
+        return drive.feedforward_activations(x, factors)
     B, T, n_in = x.shape
     rows = [r for r, _ in drive.feedforward]
     weights = [W.float() for _, W in drive.feedforward]
+    factors = [
+        None if f is None else f.reshape(B * T, -1)
+        for f in factors or [None] * len(rows)
+    ]
     A = _SparseActivations.apply(
-        x.reshape(B * T, n_in), rows, drive.differentiable_inputs, *weights
+        x.reshape(B * T, n_in), rows, factors, drive.differentiable_inputs, *weights
     )
     return A.view(len(rows), B, T, -1)
+
+
+GATE_BLOCK = 256  # gating columns per program of ``gate_scan``
+
+
+def gate_feedforward(drive: Drive, x: torch.Tensor, gating: torch.Tensor | None):
+    """``network.gate_feedforward`` by the ``gate_scan`` kernel (CUDA), one launch per
+    saturating pathway; ``gating`` is updated in place."""
+    K_rec = len(drive.recurrent)
+    gates = [drive.gate(K_rec + k) for k in range(len(drive.feedforward))]
+    if not any(gates):
+        return None, gating
+    if not x.is_cuda:
+        return _gate_ref(drive, x, gating)
+    from wiretorch.network_simulators.kernels import gate_scan
+
+    x = x.detach().float().contiguous()
+    B, T, n_in = x.shape
+    factors = []
+    for (rows, _), gate in zip(drive.feedforward, gates):
+        if gate is None:
+            factors.append(None)
+            continue
+        RG = rows.numel()
+        f = torch.empty((B, T, RG), device=x.device)
+        gate_scan[(triton.cdiv(B * RG, GATE_BLOCK),)](
+            x, rows.int().contiguous(), gate.saturation.expand(RG).contiguous(),
+            gate.decay.expand(RG).contiguous(), gating, f,
+            B, T, n_in, gating.shape[1], RG, gate.start, BLOCK=GATE_BLOCK,
+        )  # fmt: skip
+        factors.append(f)
+    return factors, gating
+
+
+def recurrent_weights(recurrent) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """The recurrent pathways' weights, each source's once (pathways that share a
+    tensor share its rows), back to back, and the row where each pathway's begin."""
+    unique, starts, offsets = [], {}, []
+    for _, W in recurrent:
+        if id(W) not in starts:
+            starts[id(W)] = sum(w.shape[0] for w in unique)
+            unique.append(W)
+        offsets.append(starts[id(W)])
+    return torch.cat(unique).float().contiguous(), tuple(offsets)
+
+
+@functools.lru_cache(maxsize=64)
+def offsets_tensor(offsets: tuple[int, ...], device) -> torch.Tensor:
+    """``offsets`` as a cached int32 tensor (see ``row_start``)."""
+    return torch.tensor(offsets, device=device, dtype=torch.int32)
 
 
 def presynaptic(W_k: torch.Tensor, dtype: torch.dtype = torch.float32):
@@ -140,23 +211,32 @@ def presynaptic(W_k: torch.Tensor, dtype: torch.dtype = torch.float32):
     return lambda g: (W_csr @ g.T.contiguous()).T
 
 
-def presynaptic_blocks(W, rows, sizes, dtype) -> list:
+def presynaptic_blocks(W, rows, sizes, dtype, w_offsets=None) -> list:
     """Per recurrent pathway: its source neurons and its ``presynaptic`` product.
 
-    ``W`` and ``rows`` hold the pathways' weight rows and source neurons back to back,
-    ``sizes`` how many each has.
+    ``rows`` holds the pathways' source neurons back to back, ``sizes`` how many each
+    has; ``W`` their weight rows, from ``w_offsets`` (default: back to back too).
+    Pathways that share weight rows share the product.
     """
     starts = [0, *itertools.accumulate(sizes)]
-    return [
-        (rows[a:b].long(), presynaptic(W[a:b], dtype))
-        for a, b in zip(starts, starts[1:])
-    ]
+    w_offsets = w_offsets or starts[:-1]
+    products = {}
+    blocks = []
+    for a, b, w in zip(starts, starts[1:], w_offsets):
+        if w not in products:
+            products[w] = presynaptic(W[w : w + b - a], dtype)
+        blocks.append((rows[a:b].long(), products[w]))
+    return blocks
 
 
-def weight_gradient(spikes, rows, sizes, grad_A) -> torch.Tensor:
-    """``dL/dW`` of the recurrent pathways, their weight rows back to back.
+def weight_gradient(
+    spikes, rows, sizes, grad_A, w_offsets=None, n_weights=None, factors=None
+) -> torch.Tensor:
+    """``dL/dW`` of the recurrent pathways' weight rows (laid out as ``w_offsets``
+    say, ``n_weights`` rows in all; default: each pathway's back to back).
 
-    ``dL/dW_k`` is the sum over (trial, step) of presynaptic spikes x ``dL/dA_k``;
+    ``dL/dW_k`` is the sum over (trial, step) of presynaptic spikes x ``dL/dA_k``, a
+    saturating pathway's spikes times their ``factors[k]`` ``(B, T, n_rows)``;
     ``grad_A`` ``(K, B, T, N)`` has the recurrent pathways first.
     """
     N = grad_A.shape[-1]
@@ -164,8 +244,15 @@ def weight_gradient(spikes, rows, sizes, grad_A) -> torch.Tensor:
     pieces = []
     for k, (a, b) in enumerate(zip(starts, starts[1:])):
         pre = spikes[:, :, rows[a:b]]
+        if factors is not None and factors[k] is not None:
+            pre = pre * factors[k]
         pieces.append(pre.reshape(-1, pre.shape[-1]).T @ grad_A[k].reshape(-1, N))
-    return torch.cat(pieces)
+    if w_offsets is None:
+        return torch.cat(pieces)
+    grad = grad_A.new_zeros((n_weights, N))
+    for w, piece in zip(w_offsets, pieces):
+        grad[w : w + piece.shape[0]] += piece
+    return grad
 
 
 def refractory_tables(n_ref, counter, dummy) -> tuple[torch.Tensor, torch.Tensor]:

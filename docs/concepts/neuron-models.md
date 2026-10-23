@@ -28,11 +28,47 @@ The block scales the current, not the conductance, so NMDA's rise and decay are 
 `tau_rise` and `tau_decay` as for any synapse type. The Mg parameters are fixed: they
 cannot be learnt.
 
-When $v$ crosses When $v$ crosses $\theta$ the neuron spikes and $v$ is reset to
+When $v$ crosses $\theta$ the neuron spikes and $v$ is reset to
 $U_\text{reset}$. An input spike increases the conductance of each synapse type its
 source makes by the weight times the peak conductance $\bar g$ (the difference of
 exponentials is normalised to peak at $\bar g$). In each step the leak and the
 conductances decay exactly, and the synaptic currents take a forward-Euler step.
+
+`g_clip` caps a synapse type's conductance (hard clipping). Saturation, below, is the
+dynamical alternative: it limits how much of a source's receptors its spikes can open.
+
+### Receptor saturation
+
+A synapse type with `saturation` $c > 0$ saturates, as NMDA receptors do (Brunel &
+Wang, 2001). Each source neuron $j$ keeps a gating variable $u_j \in [0, 1]$ per such
+type, the fraction of its receptors that are open. In each step it decays with the
+type's $\tau_\text{decay}$, and a spike then opens the fraction $c$ of the receptors
+still closed:
+
+$$
+u_j \leftarrow u_j e^{-\Delta t / \tau_\text{decay}}, \qquad
+f_j = c\,(1 - u_j), \qquad u_j \leftarrow u_j + s_j f_j
+$$
+
+The spike's input is $s_j f_j$ instead of $s_j$, so the target's conductance follows
+$\bar g \sum_j w_{ij} u_j$, exactly as $\tau_\text{rise} \to 0$ and filtered by the
+rise otherwise. For a saturating type $\bar g$ is therefore the conductance with every
+receptor open: its kernel is not normalised to peak at $\bar g$. A first spike from rest
+gives about $c \bar g$, and sustained firing approaches $\bar g$.
+
+Brunel & Wang's NMDA gating opens receptors at rate $\alpha x (1 - u)$ through a
+transmitter concentration $x$ that jumps at each spike and decays with
+$\tau_{\text{rise}}$. Here each spike opens its share at once, the limit for spikes
+further apart than $\tau_{\text{rise}}$. Their $\alpha = 0.5$ /ms over
+$\tau_\text{rise} = 2$ ms corresponds to $c = 1 - e^{-\alpha \tau_\text{rise}} \approx
+0.63$. Under Poisson input the mean gating is then within 0.03 of their $\psi(\nu)$
+(about 0.17, 0.64 and 0.79 at 3, 25 and 50 Hz).
+
+The gating variables are part of the state, carried across `forward` calls and saved
+in checkpoints. They carry no gradient themselves: a spike's gradient is scaled by its
+$f_j$. A saturating type's $\tau_\text{decay}$, which the gating shares, cannot be
+learnt. Saturation needs its own copy of the source's synaptic input, so it costs about
+15% in simulation and 40% in training on the teacher network.
 
 Gradients flow through the voltage and the conductances using a surrogate for the
 spike. By default they do not flow through recurrent spikes: the effect of a neuron's

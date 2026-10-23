@@ -45,7 +45,7 @@ connection's weight drives every synapse type its source makes.
 
 | Neuron model | Synapse parameters |
 |---|---|
-| Conductance-based | `tau_rise`, `tau_decay`, `E_syn`, `g_bar`, optional `g_clip` (a cap on the conductance) and `mg`, `mg_slope`, `mg_k` (a voltage-dependent Mg²⁺ block, for NMDA) |
+| Conductance-based | `tau_rise`, `tau_decay`, `E_syn`, `g_bar`, optional `g_clip` (a cap on the conductance), `mg`, `mg_slope`, `mg_k` (a voltage-dependent Mg²⁺ block, for NMDA) and `saturation` (receptor saturation) |
 | Current-based | `tau_syn` (0: no memory), `type` (`"excitatory"` or `"inhibitory"`) |
 | Rate | `tau_syn` (0: no memory), `type` |
 
@@ -56,8 +56,10 @@ Hz. Capping each synapse type's conductance, for example at 10 times its `g_bar`
 the step stable.
 
 An NMDA synapse type gets its voltage dependence from `mg`, the extracellular
-[Mg²⁺] in mM (1.0 is physiological; the default, 0, means no block). See
-{doc}`neuron-models`.
+[Mg²⁺] in mM (1.0 is physiological; the default, 0, means no block), and its
+saturation from `saturation`, the fraction of a source's closed receptors one spike
+opens (0.63 for Brunel & Wang's NMDA; the default, 0, means none). With saturation,
+`g_bar` is the conductance with every receptor open. See {doc}`neuron-models`.
 
 ## Dale's law
 
